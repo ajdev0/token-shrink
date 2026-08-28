@@ -8,12 +8,20 @@ import {
   createCursorRule,
   RULE_TARGET_PATH,
   CLAUDE_RULE_SENTINEL,
+  CLINE_RULE_SENTINEL,
   AUTO_RULE_SENTINEL,
   CURSOR_RULE_PATH,
   CLAUDE_RULE_PATH,
+  CLINE_RULE_PATH,
 } from '../src/mcp.js';
 
-const targets = ['cursor', 'claude'] as const;
+const targets = ['cursor', 'claude', 'cline'] as const;
+
+function sentinelFor(target: (typeof targets)[number]): string {
+  if (target === 'cursor') return AUTO_RULE_SENTINEL;
+  if (target === 'claude') return CLAUDE_RULE_SENTINEL;
+  return CLINE_RULE_SENTINEL;
+}
 
 describe('createAutoRule (idempotent per target)', () => {
   let dir: string;
@@ -31,14 +39,14 @@ describe('createAutoRule (idempotent per target)', () => {
     expect(res.filePath).toBe(rulePath);
     expect(fs.existsSync(rulePath)).toBe(true);
     const content = fs.readFileSync(rulePath, 'utf8');
-    const sentinel = target === 'cursor' ? AUTO_RULE_SENTINEL : CLAUDE_RULE_SENTINEL;
+    const sentinel = sentinelFor(target);
     expect(content).toContain(sentinel);
     expect(content).toContain('get_compressed_code_context');
   });
 
   it.each(targets)('does not rewrite when %s rule already has our sentinel', (target) => {
     const rulePath = path.join(dir, RULE_TARGET_PATH[target]);
-    const sentinel = target === 'cursor' ? AUTO_RULE_SENTINEL : CLAUDE_RULE_SENTINEL;
+    const sentinel = sentinelFor(target);
     fs.mkdirSync(path.dirname(rulePath), { recursive: true });
     fs.writeFileSync(rulePath, `custom\n${sentinel}\n`, 'utf8');
 
@@ -73,5 +81,6 @@ describe('rule path constants', () => {
   it('points at the expected integration files', () => {
     expect(CURSOR_RULE_PATH).toBe('.cursor/rules/token-shrink.mdc');
     expect(CLAUDE_RULE_PATH).toBe('.claude/rules/token-shrink.md');
+    expect(CLINE_RULE_PATH).toBe('.clinerules/token-shrink.md');
   });
 });

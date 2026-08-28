@@ -118,7 +118,7 @@ wasm/
 
 
 
-### 1. MCP server (AI agents — Cursor, Claude, etc.)
+### 1. MCP server (AI agents — Cursor, Claude, Cline, etc.)
 
 Run the stdio MCP server and expose the `get_compressed_code_context` tool:
 
@@ -166,16 +166,33 @@ or place in `.claude/settings.json` / project `.mcp.json`:
 }
 ```
 
+**Cline MCP config** — add it to the project's `.mcp.json` (or `mcp.json` in the `.cline` settings directory), or add the server via the Cline UI (**MCP Servers → Configure MCP Servers**):
+
+```json
+{
+  "mcpServers": {
+    "token-shrink": {
+      "command": "token-shrink-mcp",
+      "args": ["--root", "/path/to/project"]
+    }
+  }
+}
+```
+
 **Auto rule**: by default the server writes agent integration rules so the tool is used automatically on every prompt:
 
 - **Cursor**: `.cursor/rules/token-shrink.mdc`
 - **Claude Code**: `.claude/rules/token-shrink.md`
+- **Cline**: `.clinerules/token-shrink.md` (Cline's `.clinerules/` directory — every `.md`/`.txt` file there is loaded on every task)
 
-Both are sentinel-tagged and never rewrite a user-authored file at the same path. Repeated starts are no-ops. Choose the target(s) with `--rule-target=cursor|claude|all` (default `all`, comma-separated values allowed):
+All are sentinel-tagged and never rewrite a user-authored file at the same path. Repeated starts are no-ops. Choose the target(s) with `--rule-target=cursor|claude|cline|all` (default `all`, comma-separated values allowed):
 
 ```bash
 # only Claude Code
 token-shrink-mcp --root /path/to/project --rule-target=claude
+
+# Cursor + Cline, no Claude rule
+token-shrink-mcp --root /path/to/project --rule-target=cursor,cline
 
 # completely disable auto-rules
 token-shrink-mcp --root /path/to/project --no-create-rule

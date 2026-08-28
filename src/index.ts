@@ -34,6 +34,8 @@ export {
   CURSOR_RULE_PATH,
   CLAUDE_RULE_PATH,
   CLAUDE_RULE_SENTINEL,
+  CLINE_RULE_PATH,
+  CLINE_RULE_SENTINEL,
   RULE_TARGET_PATH,
 } from './mcp.js';
 export type { McpServerOptions, RuleWriteResult, RuleTarget } from './mcp.js';

@@ -233,13 +233,26 @@ export async function startMcpServer(opts: McpServerOptions = {}): Promise<McpSe
   return server;
 }
 
-// Start the server only when run as the MCP binary (`dist/mcp.cjs`), not when
-// imported as a library. Guard against both the source and bundled filenames.
+// Start the server only when run as the MCP binary, not when imported as a
+// library. Guard against both the source filenames and the tsup bundles:
+// `dist/mcp.cjs` (used by the npm `token-shrink-mcp` bin). `realpathSync`
+// resolves the npm bin symlink, so `token-shrink-mcp` -> `dist/mcp.cjs` is
+// detected as `mcp.cjs`.
 const argv1 = process.argv[1] ? path.basename(process.argv[1]) : '';
-if (
+let argv1Real = '';
+try {
+  argv1Real = process.argv[1]
+    ? path.basename(fs.realpathSync(process.argv[1]))
+    : '';
+} catch {
+  /* path may not exist yet (tsx/dev runners) — fall back to argv basename */
+}
+const invokedAsMcp =
   argv1 === 'mcp.js' || argv1 === 'mcp.mjs' ||
-  argv1 === 'mcp.cjs' || argv1 === 'mcp.ts'
-) {
+  argv1 === 'mcp.cjs' || argv1 === 'mcp.ts' ||
+  argv1Real === 'mcp.js' || argv1Real === 'mcp.mjs' ||
+  argv1Real === 'mcp.cjs' || argv1Real === 'mcp.ts';
+if (invokedAsMcp) {
   const rootArg = (() => {
     const i = process.argv.indexOf('--root');
     if (i !== -1 && process.argv[i + 1]) return process.argv[i + 1];

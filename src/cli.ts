@@ -10,6 +10,7 @@
 
 import Fastify from 'fastify';
 import picocolors from 'picocolors';
+import fs from 'node:fs';
 import path from 'node:path';
 
 import { assemble } from './server/assembler.js';
@@ -103,11 +104,23 @@ export async function startServer(opts: CliOptions = {}) {
   return { app, watcher };
 }
 
-// Start when invoked directly (`node dist/cli.cjs` / `token-shrink`).
+// Start when invoked directly (`node dist/cli.cjs` / the `token-shrink` bin),
+// not when imported as a library. `realpathSync` resolves the npm bin symlink,
+// so `token-shrink` -> `dist/cli.cjs` is detected as `cli.cjs`.
 const argv1 = process.argv[1] ? path.basename(process.argv[1]) : '';
+let argv1Real = '';
+try {
+  argv1Real = process.argv[1]
+    ? path.basename(fs.realpathSync(process.argv[1]))
+    : '';
+} catch {
+  /* path may not exist yet (tsx/dev runners) — fall back to argv basename */
+}
 if (
   argv1 === 'cli.js' || argv1 === 'cli.mjs' ||
-  argv1 === 'cli.cjs' || argv1 === 'cli.ts'
+  argv1 === 'cli.cjs' || argv1 === 'cli.ts' ||
+  argv1Real === 'cli.js' || argv1Real === 'cli.mjs' ||
+  argv1Real === 'cli.cjs' || argv1Real === 'cli.ts'
 ) {
   startServer().catch((err) => {
     console.error(picocolors.red(`[token-shrink] ${err.message}`));

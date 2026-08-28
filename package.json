@@ -1,0 +1,59 @@
+{
+  "name": "@ajdev0/token-shrink",
+  "version": "2.0.0",
+  "description": "Polyglot AST Semantic Proxy & MCP Server — local-first, framework-aware token reduction engine",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "token-reduction",
+    "tree-sitter",
+    "mcp",
+    "llm",
+    "context-engineering",
+    "ast"
+  ],
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "bin": {
+    "token-shrink": "dist/cli.cjs",
+    "token-shrink-mcp": "dist/mcp.cjs"
+  },
+  "files": [
+    "dist",
+    "wasm",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "start": "node dist/cli.js",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "chokidar": "^4.0.3",
+    "fastify": "^5.2.1",
+    "picocolors": "^1.1.1",
+    "web-tree-sitter": "^0.24.6",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.7",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.2"
+  }
+}

@@ -1,6 +1,6 @@
 {
   "name": "@ajdev0/token-shrink",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "Polyglot AST Semantic Proxy & MCP Server — local-first, framework-aware token reduction engine",
   "type": "module",
   "license": "MIT",

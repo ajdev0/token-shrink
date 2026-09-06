@@ -73,25 +73,8 @@ The build produces three binaries:
 | `@ajdev0/token-shrink-mcp`   | `dist/mcp.cjs`   | MCP stdio server for AI agents               |
 | library              | `dist/index.js` | `prune()`, `assemble()`, `createWatcher()` … |
 
-### Publish to npm
-
-```bash
-npm login
-npm run build && npm test
-npm pack --dry-run    # preview tarball contents
-npm publish
-```
-
-The package name on npm is **`@ajdev0/token-shrink`**. After publishing, users can run:
-
-```bash
-npx @ajdev0/token-shrink-mcp --root /path/to/project
-```
-
 
 ---
-
-
 
 ## WASM grammars (auto-download)
 
@@ -245,11 +228,8 @@ Opt out also via `--create-rule=false` or `TOKEN_SHRINK_CREATE_RULE=0`.
 - `ignorePatterns` — globs that are never indexed or watched.
 - `keepUnpruned` — files that are indexed but never pruned (always full text).
 - `preserveAnnotations` — definitions (and everything nested in them) preceded by `@marker` are kept fully un-pruned.
-- `autoWorkflow` — `true` (default) writes **auto-workflow rules** that make the agent run the right tool automatically on each task: context for the active file → symbol search for identifiers it doesn't already know → expand pruned bodies it must modify → git impact for dirty/multi-file work. Set to `false` for lightweight rules where the model decides on its own.
 
 Invalid JSON logs a warning and falls back to defaults; editing the file while the server runs re-indexes automatically.
-
-**Automatic workflows & event hooks:** the generated rules (Cursor / Claude Code / Cline) choreograph the tools per task, and existing installs **self-upgrade to the newest rule text on the next server start** via the rule version marker. Claude Code additionally supports real event automation — see [`hooks/claude/README.md`](hooks/claude/README.md) for sample `SessionStart`/`Stop` hooks that auto-inject a compact git-impact summary into every session.
 
 ### 2. HTTP server (Fastify)
 

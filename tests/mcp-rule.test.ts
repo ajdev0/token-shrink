@@ -7,6 +7,7 @@ import {
   createAutoRule,
   createCursorRule,
   RULE_TARGET_PATH,
+  RULE_VERSION_MARKER,
   CLAUDE_RULE_SENTINEL,
   CLINE_RULE_SENTINEL,
   AUTO_RULE_SENTINEL,
@@ -44,16 +45,30 @@ describe('createAutoRule (idempotent per target)', () => {
     expect(content).toContain('get_compressed_code_context');
   });
 
-  it.each(targets)('does not rewrite when %s rule already has our sentinel', (target) => {
+  it.each(targets)('does not rewrite when the %s rule already has our sentinel + version marker', (target) => {
     const rulePath = path.join(dir, RULE_TARGET_PATH[target]);
     const sentinel = sentinelFor(target);
     fs.mkdirSync(path.dirname(rulePath), { recursive: true });
-    fs.writeFileSync(rulePath, `custom\n${sentinel}\n`, 'utf8');
+    fs.writeFileSync(rulePath, `custom\n${RULE_VERSION_MARKER}\n${sentinel}\n`, 'utf8');
 
     const res = createAutoRule(dir, target);
     expect(res.created).toBe(false);
     expect(res.skipped).toBe('exists');
-    expect(fs.readFileSync(rulePath, 'utf8')).toBe(`custom\n${sentinel}\n`);
+    expect(fs.readFileSync(rulePath, 'utf8')).toBe(`custom\n${RULE_VERSION_MARKER}\n${sentinel}\n`);
+  });
+
+  it.each(targets)('upgrades a legacy %s rule that predates the version marker', (target) => {
+    const rulePath = path.join(dir, RULE_TARGET_PATH[target]);
+    const sentinel = sentinelFor(target);
+    fs.mkdirSync(path.dirname(rulePath), { recursive: true });
+    // v1 files were tagged with the sentinel only.
+    fs.writeFileSync(rulePath, `legacy body\n${sentinel}\n`, 'utf8');
+
+    const res = createAutoRule(dir, target);
+    expect(res.created).toBe(true);
+    const content = fs.readFileSync(rulePath, 'utf8');
+    expect(content).toContain(RULE_VERSION_MARKER);
+    expect(content).toContain('expand_symbol'); // new-tool guidance present
   });
 
   it.each(targets)("leaves a user-authored %s rule untouched without sentinel", (target) => {
@@ -82,5 +97,32 @@ describe('rule path constants', () => {
     expect(CURSOR_RULE_PATH).toBe('.cursor/rules/token-shrink.mdc');
     expect(CLAUDE_RULE_PATH).toBe('.claude/rules/token-shrink.md');
     expect(CLINE_RULE_PATH).toBe('.clinerules/token-shrink.md');
+  });
+});
+
+describe('autoWorkflow toggle (.tokenshrinkrc.json)', () => {
+  it('writes choreographed workflow rules by default', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-rule-wf-'));
+    const res = createAutoRule(dir, 'cline');
+    expect(res.created).toBe(true);
+    const content = fs.readFileSync(path.join(dir, CLINE_RULE_PATH), 'utf8');
+    expect(content).toContain('Pass activeFiles'); // workflow-only guidance
+    expect(content).toContain('git_diff_context');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('writes lightweight rules when autoWorkflow is false', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-rule-lite-'));
+    fs.writeFileSync(
+      path.join(dir, '.tokenshrinkrc.json'),
+      JSON.stringify({ autoWorkflow: false }),
+      'utf8',
+    );
+    const res = createAutoRule(dir, 'cline');
+    expect(res.created).toBe(true);
+    const content = fs.readFileSync(path.join(dir, CLINE_RULE_PATH), 'utf8');
+    expect(content).not.toContain('Pass activeFiles');
+    expect(content).toContain('search_symbol_signatures');
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 });

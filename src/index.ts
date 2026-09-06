@@ -6,10 +6,29 @@
  * (HTTP) and `./mcp.js` (MCP stdio), which are the packaged CLIs.
  */
 
-export { prune, spliceRanges } from './parser/pruner.js';
+export { prune, spliceRanges, analyze, ensureParserInit, loadLanguage } from './parser/analyze.js';
+export type { AnalyzeOptions, AnalyzeResult, PruneRange } from './parser/analyze.js';
+export { collectSymbols, matchSymbols } from './parser/symbols.js';
+export type { SymbolInfo, SymbolKind } from './parser/symbols.js';
 export { languageForFile, registry, supportedLanguageIds, allExtensions } from './parser/registry.js';
 export type { LanguageSpec, Replacement } from './parser/registry.js';
 export { getGrammar, warmGrammars } from './parser/wasm.js';
+
+export { detectProjectRoot, PROJECT_MANIFEST_FILES, VCS_MARKER_DIRS } from './detect.js';
+
+export { SymbolSearch } from './search/index.js';
+export type { SymbolDoc, SymbolHit } from './search/index.js';
+
+export {
+  loadConfig,
+  matchesAny,
+  matchesGlob,
+  globToRegExp,
+  EMPTY_CONFIG,
+  CONFIG_FILE_NAME,
+  configPathFor,
+} from './config.js';
+export type { TokenShrinkConfig } from './config.js';
 
 export {
   createWatcher,
@@ -20,8 +39,8 @@ export {
 } from './watcher/sync.js';
 export type { CacheEntry, GraphCache, SyncOptions } from './watcher/sync.js';
 
-export { assemble, extractSpecifiers, approximateTokens } from './server/assembler.js';
-export type { AssembleOptions, AssembleResult } from './server/assembler.js';
+export { assemble, assembleMany, extractSpecifiers, approximateTokens } from './server/assembler.js';
+export type { AssembleOptions, AssembleResult, TokenStats } from './server/assembler.js';
 
 export { startServer } from './cli.js';
 export type { CliOptions } from './cli.js';

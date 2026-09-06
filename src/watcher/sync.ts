@@ -17,7 +17,10 @@ import { createHash } from 'node:crypto';
 
 import chokidar, { type FSWatcher, type Matcher } from 'chokidar';
 
-import { ensureParserInit, prune } from '../parser/pruner.js';
+import { ensureParserInit } from '../parser/pruner.js';
+import { analyze } from '../parser/analyze.js';
+import type { SymbolInfo } from '../parser/symbols.js';
+import { matchesAny, type TokenShrinkConfig } from '../config.js';
 
 export type { Matcher };
 
@@ -37,6 +40,8 @@ export interface CacheEntry {
   language: string | null;
   /** Absolute paths of the files this file imports. */
   imports: string[];
+  /** Named definitions found while indexing (for expand_symbol / search). */
+  symbols?: SymbolInfo[];
 }
 
 export type GraphCache = Map<string, CacheEntry>;
@@ -154,7 +159,11 @@ function resolveCandidate(p: string): string | null {
 export interface SyncOptions {
   root: string;
   ignored?: Matcher[];
+  /** Optional `.tokenshrinkrc.json` settings. */
+  config?: TokenShrinkConfig;
   onIndexed?: (filePath: string, entry: CacheEntry) => void;
+  /** Called when a watched file disappears from disk (cache entry dropped). */
+  onRemoved?: (filePath: string) => void;
 }
 
 /**
@@ -164,7 +173,17 @@ export interface SyncOptions {
  */
 export function createWatcher(opts: SyncOptions) {
   const cache = new ContextCache();
-  const { root, ignored = DEFAULT_IGNORED, onIndexed } = opts;
+  const { root, ignored = DEFAULT_IGNORED, config, onIndexed, onRemoved } = opts;
+
+  // Config `ignorePatterns` become extra matchers evaluated against the path
+  // relative to the repo root (so globs like `**/dist/**` behave predictably).
+  const rel = (abs: string) => path.relative(root, abs);
+  const effectiveIgnored: Matcher[] = [
+    ...ignored,
+    ...(config?.ignorePatterns?.length
+      ? [(_abs: string) => matchesAny(rel(String(_abs)), config.ignorePatterns)]
+      : []),
+  ];
 
   // Debounce a burst of events into a single re-prune per file.
   const pending = new Map<string, NodeJS.Timeout>();
@@ -185,8 +204,14 @@ export function createWatcher(opts: SyncOptions) {
     if (cached && cached.hash === hash) return; // unchanged
 
     await cache.ensureInit();
-    const { code, language } = await prune(abs, source);
-    const imports = await extractImports(abs, source);
+    const keepFull = config?.keepUnpruned?.length
+      ? matchesAny(path.relative(root, abs), config.keepUnpruned)
+      : false;
+    const { code, language, symbols } = await analyze(abs, source, {
+      skipPrune: keepFull,
+      preserveAnnotations: config?.preserveAnnotations,
+    });
+    const imports = extractImports(abs, source);
     const entry: CacheEntry = {
       hash,
       skeleton: code,
@@ -194,6 +219,7 @@ export function createWatcher(opts: SyncOptions) {
       imports: imports
         .map((spec) => resolveImport(abs, spec, root))
         .filter((p): p is string => p !== null),
+      ...(symbols.length > 0 ? { symbols } : {}),
     };
     cache.entries.set(abs, entry);
     onIndexed?.(abs, entry);
@@ -204,7 +230,7 @@ export function createWatcher(opts: SyncOptions) {
     // sockets) are never opened with fs.watch (which raises UVException).
     ignored(_p, stats) {
       if (stats && !stats.isFile() && !stats.isDirectory()) return true;
-      return isIgnored(path.resolve(String(_p)), ignored);
+      return isIgnored(path.resolve(String(_p)), effectiveIgnored);
     },
     alwaysStat: true,
     ignoreInitial: true,
@@ -229,6 +255,7 @@ export function createWatcher(opts: SyncOptions) {
   watcher.on('unlink', (filePath: string) => {
     const abs = path.resolve(filePath);
     cache.entries.delete(abs);
+    onRemoved?.(abs);
   });
 
   return {
@@ -242,7 +269,7 @@ export function createWatcher(opts: SyncOptions) {
      */
     async indexAll(): Promise<number> {
       const files: string[] = [];
-      await walk(root, (f) => files.push(f), ignored);
+      await walk(root, (f) => files.push(f), effectiveIgnored);
       let ok = 0;
       for (const f of files) {
         try {
@@ -280,6 +307,10 @@ async function walk(
 
 function isIgnored(abs: string, ignored: Matcher[]): boolean {
   for (const m of ignored) {
+    if (typeof m === 'function') {
+      if (m(abs)) return true;
+      continue;
+    }
     if (typeof m === 'string' && abs.includes(m)) return true;
     if (m instanceof RegExp && m.test(abs)) return true;
   }

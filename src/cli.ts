@@ -13,7 +13,7 @@ import picocolors from 'picocolors';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { assemble } from './server/assembler.js';
+import { assembleMany } from './server/assembler.js';
 import { createWatcher, type Matcher } from './watcher/sync.js';
 import { warmGrammars } from './parser/wasm.js';
 
@@ -50,6 +50,10 @@ export async function startServer(opts: CliOptions = {}) {
   const host = opts.host ?? args.host ?? '0.0.0.0';
   const root = path.resolve(opts.root ?? args.root ?? process.cwd());
   const silent = opts.silent ?? args.silent === 'true';
+  // Optional server-wide token budget: --max-tokens 4000.
+  const maxTokensDefault = args['max-tokens']
+    ? Number(args['max-tokens'])
+    : undefined;
 
   const log = (msg: string) => {
     if (!silent) console.log(picocolors.dim(msg));
@@ -75,21 +79,39 @@ export async function startServer(opts: CliOptions = {}) {
   app.post('/v1/context', async (req, reply) => {
     const body = (req.body ?? {}) as {
       activeFilePath?: string;
+      activeFiles?: string[];
       maxSkeletons?: number;
+      maxTokens?: number;
       includeStats?: boolean;
     };
-    if (!body.activeFilePath) {
-      return reply.status(400).send({ error: '`activeFilePath` is required' });
+    const hasMany = Array.isArray(body.activeFiles) && body.activeFiles.length > 0;
+    if (hasMany && body.activeFilePath) {
+      return reply
+        .status(400)
+        .send({ error: 'Pass either `activeFilePath` or `activeFiles`, not both.' });
     }
-    const result = assemble(body.activeFilePath, watcher.cache.entries, {
+    const paths = hasMany
+      ? (body.activeFiles as string[])
+      : body.activeFilePath
+        ? [body.activeFilePath]
+        : [];
+    if (paths.length === 0) {
+      return reply.status(400).send({ error: '`activeFilePath` or `activeFiles` is required' });
+    }
+    const maxTokens =
+      body.maxTokens !== undefined ? body.maxTokens : maxTokensDefault;
+    const result = assembleMany(paths, watcher.cache.entries, {
       maxSkeletons: body.maxSkeletons,
+      maxTokens: Number.isFinite(maxTokens as number) ? (maxTokens as number) : undefined,
       includeStats: body.includeStats,
     });
     return {
       markdown: result.markdown,
       activeFilePath: result.activeFilePath,
+      activeFilePaths: result.activeFilePaths,
       dependencies: result.included.map((i) => i.filePath),
       unresolved: result.unresolved,
+      tokenStats: result.tokenStats,
     };
   });
 

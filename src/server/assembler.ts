@@ -19,107 +19,206 @@ export interface AssembleOptions {
   includeStats?: boolean;
   /** Maximum number of ring-1 files to include. */
   maxSkeletons?: number;
+  /**
+   * Hard token budget for the whole payload (Ring 0 + Ring 1). When set, Ring 1
+   * candidates are ranked by relevance and greedily packed until the budget is
+   * exhausted; Ring 0 is always kept in full.
+   */
+  maxTokens?: number;
   /** Whether the active file itself should also be pruned (Ring 0 raw by default). */
   pruneActiveFile?: boolean;
+}
+
+/** Token accounting for an assembled payload. */
+export interface TokenStats {
+  activeTokens: number;
+  dependencyTokens: number;
+  totalTokens: number;
+  /** When `maxTokens` was supplied, the budget that was enforced. */
+  budget?: number;
+  /** Number of Ring 1 candidates dropped by the token budget. */
+  trimmed: number;
 }
 
 export interface AssembleResult {
   /** Human-readable Markdown payload for an agent. */
   markdown: string;
+  /** First active file (back-compat; prefer `activeFilePaths`). */
   activeFilePath: string;
-  /** Ring-0 full text of the active file. */
+  /** Every resolved Ring-0 path, in request order. */
+  activeFilePaths: string[];
+  /** Ring-0 full text of the active file(s). */
   activeSource: string;
   /** Ring-1 entries actually included. */
   included: { filePath: string; language: string | null }[];
   /** Paths referenced by imports that could not be resolved to a file. */
   unresolved: string[];
+  /** Approximate token accounting for this payload. */
+  tokenStats: TokenStats;
 }
 
+/** Markdown headers/fences overhead subtracted from a `maxTokens` budget. */
+const MARKDOWN_OVERHEAD_TOKENS = 40;
+
 /**
- * Build the compressed context for an open file.
- * `activeFilePath` may be absolute or project-relative.
+ * Build the compressed context for one or more open files.
+ * `activeFiles` may be absolute or project-relative. Every listed file is
+ * emitted in full as Ring 0; the combined set of their local imports is
+ * emitted as pruned Ring-1 skeletons, minus any file already in Ring 0.
+ *
+ * When `opts.maxTokens` is set, Ring 1 candidates are ranked by a cheap
+ * relevance proxy (fan-in → path depth → declaration order) and greedily
+ * packed until the budget is exhausted; Ring 0 is always kept in full.
  */
-export function assemble(
-  activeFilePath: string,
+export function assembleMany(
+  activeFiles: string[],
   cache: GraphCache,
   opts: AssembleOptions = {},
 ): AssembleResult {
-  const { includeStats = false, maxSkeletons = 50, pruneActiveFile = false } = opts;
+  const {
+    includeStats = false,
+    maxSkeletons = 50,
+    maxTokens,
+    pruneActiveFile = false,
+  } = opts;
 
-  const abs = path.resolve(activeFilePath);
-  const activeSource = fs.existsSync(abs) ? fs.readFileSync(abs, 'utf8') : '';
-  const activeEntry = cache.get(abs);
+  const absList = activeFiles.map((p) => path.resolve(p));
+  const sources = absList.map((abs) => {
+    try {
+      return fs.readFileSync(abs, 'utf8');
+    } catch {
+      return '';
+    }
+  });
+  const activeSet = new Set(absList);
+
+  // Ring-0 text that will actually be emitted (pruned only on request).
+  const ring0Texts = absList.map((abs, i) => {
+    const entry = cache.get(abs);
+    return pruneActiveFile && entry ? entry.skeleton : sources[i];
+  });
 
   const included: AssembleResult['included'] = [];
   const unresolved: string[] = [];
-
-  // Ring 1: walk the active file's direct imports.
   const seen = new Set<string>();
-  if (activeEntry) {
-    for (const imp of activeEntry.imports) {
-      const entry = cache.get(imp);
-      if (!entry) {
-        unresolved.push(imp);
-        continue;
+  const addUnresolved = (p: string) => {
+    if (!unresolved.includes(p)) unresolved.push(p);
+  };
+  const addIncluded = (p: string, allowUncached: boolean) => {
+    if (seen.has(p)) return;
+    const entry = cache.get(p);
+    if (!entry && !allowUncached) {
+      addUnresolved(p);
+      return;
+    }
+    seen.add(p);
+    included.push({ filePath: p, language: entry?.language ?? null });
+  };
+
+  for (let i = 0; i < absList.length; i++) {
+    const abs = absList[i];
+    const entry = cache.get(abs);
+    if (entry) {
+      // Indexed active file: walk its resolved imports.
+      for (const imp of entry.imports) {
+        if (activeSet.has(imp)) continue; // already full Ring 0
+        addIncluded(imp, false);
       }
-      if (seen.has(imp)) continue;
-      seen.add(imp);
-      included.push({ filePath: imp, language: entry.language });
-      if (included.length >= maxSkeletons) break;
+    } else if (sources[i]) {
+      // Unindexed active file: resolve imports from disk with the fallback
+      // so the payload is still useful.
+      for (const spec of extractSpecifiers(sources[i])) {
+        const resolved = resolveLocal(abs, spec);
+        if (!resolved) {
+          addUnresolved(spec);
+          continue;
+        }
+        if (activeSet.has(resolved)) continue;
+        addIncluded(resolved, true);
+      }
     }
   }
 
-  // If the active file is unsupported (no cache entry), try to resolve its
-  // imports on the fly from disk so the payload is still useful.
-  if (!activeEntry && activeSource) {
-    // Fallback: derive imports from a lightweight regex and resolve from disk.
-    const specifiers = extractSpecifiers(activeSource);
-    for (const spec of specifiers) {
-      const resolved = resolveLocal(abs, spec);
-      if (!resolved) {
-        unresolved.push(spec);
-        continue;
-      }
-      if (seen.has(resolved)) continue;
-      seen.add(resolved);
-      const cached = cache.get(resolved);
-      included.push({ filePath: resolved, language: cached?.language ?? null });
-      if (included.length >= maxSkeletons) break;
+  // Keep declaration order by default (stable output); rank by relevance only
+  // when a token budget forces us to drop lower-value dependencies.
+  const ordered =
+    maxTokens === undefined ? included : rankByRelevance(included, cache);
+
+  // Greedy packing: respect maxSkeletons always; additionally stay within the
+  // token budget when one is given.
+  const budget =
+    maxTokens === undefined
+      ? undefined
+      : Math.max(0, maxTokens - MARKDOWN_OVERHEAD_TOKENS);
+  const selected: AssembleResult['included'] = [];
+  let trimmed = 0;
+  let dependencyTokens = 0;
+  for (const cand of ordered) {
+    if (selected.length >= maxSkeletons) break;
+    const entry = cache.get(cand.filePath);
+    // Unindexed candidates get a small nominal cost until they are indexed.
+    const cost = entry ? approximateTokens(entry.skeleton) : 8;
+    if (budget !== undefined && dependencyTokens + cost > budget) {
+      trimmed++;
+      continue;
     }
+    selected.push(cand);
+    dependencyTokens += cost;
   }
+  const activeTokens = ring0Texts.reduce(
+    (acc, t) => acc + approximateTokens(t),
+    0,
+  );
 
   const lines: string[] = [];
   lines.push('# Compressed Code Context', '');
-  lines.push(`Active file: \`${rel(abs)}\``, '');
+
+  if (absList.length === 1) {
+    lines.push(`Active file: \`${rel(absList[0])}\``, '');
+  } else {
+    lines.push('Active files:', '');
+    for (const p of absList) lines.push(`- \`${rel(p)}\``);
+    lines.push('');
+  }
 
   // Ring 0.
-  lines.push('## Ring 0 — Active file (full text)', '');
-  const ring0 = pruneActiveFile && activeEntry ? activeEntry.skeleton : activeSource;
-  lines.push(`\`\`\`${ext(activeFilePath)}`);
-  lines.push(ring0.trim() || '(empty or unreadable file)');
-  lines.push('```', '');
+  lines.push(
+    absList.length === 1
+      ? '## Ring 0 — Active file (full text)'
+      : '## Ring 0 — Active files (full text)',
+    '',
+  );
+  for (let i = 0; i < absList.length; i++) {
+    if (absList.length > 1) lines.push(`### \`${rel(absList[i])}\``, '');
+    const body = ring0Texts[i].trim() || '(empty or unreadable file)';
+    lines.push(`\`\`\`${ext(absList[i])}`, body, '```', '');
+  }
 
   // Ring 1.
   lines.push(
-    `## Ring 1 — Pruned dependencies (${included.length})`,
+    `## Ring 1 — Pruned dependencies (${selected.length})`,
     '',
     'Implementation bodies removed; type signatures, interfaces and exports retained.',
     '',
   );
-  if (included.length === 0) {
+  if (selected.length === 0) {
     lines.push('_No local dependency skeletons available._', '');
   }
-  for (const inc of included) {
+  for (const inc of selected) {
     const entry = cache.get(inc.filePath);
     const label = rel(inc.filePath);
     lines.push(`### \`${label}\``, '');
     if (entry) {
-      lines.push(`\`\`\`${ext(inc.filePath)}`);
-      lines.push(entry.skeleton.trim());
-      lines.push('```', '');
+      lines.push(`\`\`\`${ext(inc.filePath)}`, entry.skeleton.trim(), '```', '');
     } else {
       lines.push('_Unindexed file._', '');
     }
+  }
+  if (maxTokens !== undefined && trimmed > 0) {
+    lines.push(
+      `_Note: token budget of ${maxTokens} excluded ${trimmed} lower-priority dependenc${trimmed === 1 ? 'y' : 'ies'}._`,
+      '',
+    );
   }
 
   if (unresolved.length > 0) {
@@ -129,27 +228,71 @@ export function assemble(
   }
 
   if (includeStats) {
-    const depTokens = included.reduce(
-      (acc, inc) => {
-        const e = cache.get(inc.filePath);
-        return e ? acc + approximateTokens(e.skeleton) : acc;
-      },
-      0,
-    );
-    lines.push('---', '');
+    const budgetNote =
+      maxTokens !== undefined ? ` · budget ${maxTokens} (${trimmed} deps trimmed)` : '';
     lines.push(
-      `_Token estimate — active: ${approximateTokens(activeSource)} · pruned deps: ${depTokens}._`,
+      '---',
+      '',
+      `_Token estimate — active: ${activeTokens} · pruned deps: ${dependencyTokens}${budgetNote}._`,
       '',
     );
   }
 
   return {
     markdown: lines.join('\n'),
-    activeFilePath: abs,
-    activeSource,
-    included,
+    activeFilePath: absList[0] ?? '',
+    activeFilePaths: absList,
+    activeSource: sources.join('\n'),
+    included: selected,
     unresolved,
+    tokenStats: {
+      activeTokens,
+      dependencyTokens,
+      totalTokens: activeTokens + dependencyTokens,
+      ...(maxTokens !== undefined ? { budget: maxTokens } : {}),
+      trimmed,
+    },
   };
+}
+
+/**
+ * Build the compressed context for a single open file.
+ * `activeFilePath` may be absolute or project-relative.
+ */
+export function assemble(
+  activeFilePath: string,
+  cache: GraphCache,
+  opts: AssembleOptions = {},
+): AssembleResult {
+  return assembleMany([activeFilePath], cache, opts);
+}
+
+/** Rank Ring-1 candidates by a cheap relevance proxy: fan-in desc, then depth asc. */
+function rankByRelevance(
+  candidates: AssembleResult['included'],
+  cache: GraphCache,
+): AssembleResult['included'] {
+  const fanIn = new Map<string, number>();
+  for (const entry of cache.values()) {
+    for (const imp of entry.imports) fanIn.set(imp, (fanIn.get(imp) ?? 0) + 1);
+  }
+  return candidates
+    .map((cand, idx) => ({ cand, idx }))
+    .sort((a, b) => {
+      const fa = fanIn.get(a.cand.filePath) ?? 0;
+      const fb = fanIn.get(b.cand.filePath) ?? 0;
+      if (fa !== fb) return fb - fa;
+      const da = pathDepth(a.cand.filePath);
+      const db = pathDepth(b.cand.filePath);
+      if (da !== db) return da - db;
+      return a.idx - b.idx;
+    })
+    .map((x) => x.cand);
+}
+
+/** Number of path segments (a rough "nearby module" proxy). */
+function pathDepth(p: string): number {
+  return p.split(/[/\\]+/).filter(Boolean).length;
 }
 
 /** Fallback import specifier extraction when no AST index exists yet. */

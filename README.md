@@ -131,6 +131,16 @@ ROOT=/path/to/project token-shrink-mcp
 cd /path/to/project && token-shrink-mcp
 ```
 
+> **Zero-config auto-detect**: `--root` is optional. When neither `--root` nor
+> `ROOT` is set, the server finds the project itself — it walks up for VCS
+> directories (`.git`/`.hg`/`.svn`) or project manifests (`package.json`,
+> `pyproject.toml`, `go.mod`, `Cargo.toml`, …), first around the directory the
+> client launched it from, and otherwise lazily from the `activeFilePath` of the
+> first `get_compressed_code_context` call (re-pointing if a later call opens a
+> different project). The config examples below keep `--root` so the behavior is
+> pinned and the index is already warm before the first request — but you may
+> simply drop the `--root` argument entirely.
+
 **Cursor MCP config** (`.cursor/mcp.json`):
 
 ```json
@@ -200,30 +210,58 @@ token-shrink-mcp --root /path/to/project --no-create-rule
 
 Opt out also via `--create-rule=false` or `TOKEN_SHRINK_CREATE_RULE=0`.
 
-**Tool:** `get_compressed_code_context`
+**MCP tools**
 
+`get_compressed_code_context` — compressed context for one or more active files (Ring 0 full, Ring 1 pruned):
 
-| Argument         | Type      | Required | Description                                   |
-| ---------------- | --------- | -------- | --------------------------------------------- |
-| `activeFilePath` | `string`  | yes      | The file the agent is working on              |
-| `maxSkeletons`   | `number`  | no       | Cap on Ring-1 files (default `50`, max `200`) |
-| `includeStats`   | `boolean` | no       | Append approximate token counts               |
+| Argument         | Type       | Required | Description                                        |
+| ---------------- | ---------- | -------- | -------------------------------------------------- |
+| `activeFilePath` | `string`   | no*      | Single file the agent is working on                |
+| `activeFiles`    | `string[]` | no*      | Multiple Ring-0 files (combined Ring 1)            |
+| `maxSkeletons`   | `number`   | no       | Cap on Ring-1 files (default `50`, max `200`)      |
+| `maxTokens`      | `number`   | no       | Hard token budget; Ring 1 is relevance-packed to fit |
+| `includeStats`   | `boolean`  | no       | Append approximate token counts                    |
 
+\* Provide exactly one of `activeFilePath` / `activeFiles`. Ring 0 stays full; Ring 1 is the union of each file's local imports, minus files already in Ring 0.
 
-Returns a Markdown payload with the active file fully inlined (Ring 0) and the pruned skeletons of its direct imports (Ring 1).
+`expand_symbol({ filePath, symbolName, maxMatches? })` — when a skeleton isn't enough, returns the **full, un-pruned definition** (function/class/method/… bodies included) for the named symbol in that file. Overloads and same-named members are all returned.
+
+`git_diff_context({ scope?, base?, head?, includeUntracked?, maxFiles?, maxImporters?, maxSkeletons?, maxTokens? })` — impact analysis for changed code:
+- `scope`: `worktree` (default) · `staged` · `branch` (`base...head`, defaults `HEAD~1...HEAD`)
+- changed files are emitted in full as Ring 0; their imports **and** the files that import them (file-level callers) are attached as pruned skeletons. Great for PR reviews and multi-file regressions where there is no single active file.
+
+`search_symbol_signatures({ query, maxResults?, kind? })` — repo-wide lookup of definitions backed by an in-memory index of the tree-sitter symbol pass. Returns compact `` `file:line — signature` `` lines (not raw file dumps), ranked exact → prefix → substring.
+
+**Project config (`.tokenshrinkrc.json`)** at the repository root — hot-reloaded:
+
+```json
+{
+  "ignorePatterns": ["**/dist/**", "**/generated/**"],
+  "keepUnpruned": ["src/types/global.d.ts", "lib/models/*.dart"],
+  "preserveAnnotations": ["@keepContext", "@api"]
+}
+```
+
+- `ignorePatterns` — globs that are never indexed or watched.
+- `keepUnpruned` — files that are indexed but never pruned (always full text).
+- `preserveAnnotations` — definitions (and everything nested in them) preceded by `@marker` are kept fully un-pruned.
+- `autoWorkflow` — `true` (default) writes **auto-workflow rules** that make the agent run the right tool automatically on each task: context for the active file → symbol search for identifiers it doesn't already know → expand pruned bodies it must modify → git impact for dirty/multi-file work. Set to `false` for lightweight rules where the model decides on its own.
+
+Invalid JSON logs a warning and falls back to defaults; editing the file while the server runs re-indexes automatically.
+
+**Automatic workflows & event hooks:** the generated rules (Cursor / Claude Code / Cline) choreograph the tools per task, and existing installs **self-upgrade to the newest rule text on the next server start** via the rule version marker. Claude Code additionally supports real event automation — see [`hooks/claude/README.md`](hooks/claude/README.md) for sample `SessionStart`/`Stop` hooks that auto-inject a compact git-impact summary into every session.
 
 ### 2. HTTP server (Fastify)
 
 ```bash
-token-shrink --root /path/to/project --port 3000
+token-shrink --root /path/to/project --port 3000 --max-tokens 4000
 # env equivalents: ROOT=… PORT=… HOST=…
 ```
 
-
-| Route         | Method | Body                                               | Returns                          |
-| ------------- | ------ | -------------------------------------------------- | -------------------------------- |
-| `/health`     | `GET`  | —                                                  | status, root, indexed file count |
-| `/v1/context` | `POST` | `{ activeFilePath, maxSkeletons?, includeStats? }` | assembled Markdown + deps        |
+| Route         | Method | Body                                                   | Returns                          |
+| ------------- | ------ | ------------------------------------------------------ | -------------------------------- |
+| `/health`     | `GET`  | —                                                      | status, root, indexed file count |
+| `/v1/context` | `POST` | `{ activeFilePath? \| activeFiles?, maxSkeletons?, maxTokens?, includeStats? }` | assembled Markdown + deps + stats |
 
 
 ```bash
@@ -232,7 +270,7 @@ curl -s http://localhost:3000/health
 
 curl -s -X POST http://localhost:3000/v1/context \
   -H 'Content-Type: application/json' \
-  -d '{"activeFilePath":"./src/page.ts","includeStats":true}'
+  -d '{"activeFiles":["./src/page.ts","./src/api.ts"],"includeStats":true}'
 ```
 
 

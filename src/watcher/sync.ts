@@ -164,6 +164,8 @@ export interface SyncOptions {
   onIndexed?: (filePath: string, entry: CacheEntry) => void;
   /** Called when a watched file disappears from disk (cache entry dropped). */
   onRemoved?: (filePath: string) => void;
+  /** Watch/index failures; defaults to a diagnostic on stderr. */
+  onError?: (error: Error) => void;
 }
 
 /**
@@ -173,7 +175,15 @@ export interface SyncOptions {
  */
 export function createWatcher(opts: SyncOptions) {
   const cache = new ContextCache();
-  const { root, ignored = DEFAULT_IGNORED, config, onIndexed, onRemoved } = opts;
+  const { ignored = DEFAULT_IGNORED, config, onIndexed, onRemoved } = opts;
+  const root = path.resolve(opts.root);
+  const realRoot = fs.realpathSync(root);
+  if (realRoot === path.parse(realRoot).root) {
+    throw new Error('Refusing to watch the filesystem root. Pass --root /path/to/project.');
+  }
+  const reportError = opts.onError ?? ((error: Error) => {
+    process.stderr.write(`[token-shrink] Watch/index error: ${error.message}\n`);
+  });
 
   // Config `ignorePatterns` become extra matchers evaluated against the path
   // relative to the repo root (so globs like `**/dist/**` behave predictably).
@@ -233,17 +243,20 @@ export function createWatcher(opts: SyncOptions) {
       return isIgnored(path.resolve(String(_p)), effectiveIgnored);
     },
     alwaysStat: true,
+    followSymlinks: false,
+    ignorePermissionErrors: true,
     ignoreInitial: true,
     persistent: true,
     awaitWriteFinish: { stabilityThreshold: 50, pollInterval: 10 },
   });
+  watcher.on('error', (error) => reportError(error instanceof Error ? error : new Error(String(error))));
 
   function debounce(filePath: string) {
     const abs = path.resolve(filePath);
     const existing = pending.get(abs);
     if (existing) clearTimeout(existing);
     // Fire immediately on the first event, then coalesce noise.
-    if (!existing) void handle(abs);
+    if (!existing) void handle(abs).catch(reportError);
     pending.set(
       abs,
       setTimeout(() => pending.delete(abs), DEBOUNCE_MS),
@@ -281,7 +294,11 @@ export function createWatcher(opts: SyncOptions) {
       }
       return ok;
     },
-    close: () => watcher.close(),
+    close: () => {
+      for (const timer of pending.values()) clearTimeout(timer);
+      pending.clear();
+      return watcher.close();
+    },
   };
 }
 
@@ -291,7 +308,14 @@ async function walk(
   push: (f: string) => void,
   ignored: Matcher[],
 ): Promise<void> {
-  const entries = await fs.promises.readdir(root, { withFileTypes: true });
+  let entries: fs.Dirent[];
+  try {
+    entries = await fs.promises.readdir(root, { withFileTypes: true });
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'EACCES' || code === 'EPERM' || code === 'ENOENT') return;
+    throw error;
+  }
   for (const e of entries) {
     const abs = path.join(root, e.name);
     if (isIgnored(abs, ignored)) continue;

@@ -5,10 +5,10 @@ Copy these into your project and merge `settings.example.json` into
 
 ```bash
 mkdir -p .claude/hooks
-cp hooks/claude/git-impact.mjs .claude/hooks/
+cp hooks/claude/git-impact.mjs hooks/claude/statusline.mjs .claude/hooks/
 cp hooks/claude/settings.example.json .claude/settings.example.json
-# then merge the "hooks" block from settings.example.json into your
-# .claude/settings.json (project- or user-level)
+# then merge the "statusLine" and "hooks" blocks from settings.example.json
+# into your .claude/settings.json (project- or user-level)
 ```
 
 What it does:
@@ -18,6 +18,13 @@ What it does:
   working tree is dirty.
 - Claude Code surfaces hook stdout in the session, so diff context is injected
   automatically — no prompt engineering required.
+
+- The `statusLine` runs `statusline.mjs`, which shows **in yellow** how many
+  tokens token-shrink saved on the last call and over the session, e.g.
+  `⚡ token-shrink −10,544 tokens (84.5%) · session −52,310 (81.2%)`. It reads
+  `.token-shrink/stats.json`, which the MCP server updates after every
+  `get_compressed_code_context` / `git_diff_context` call (disable with
+  `--no-stats` or `TOKEN_SHRINK_STATS=0`).
 
 Notes & limits:
 

@@ -22,6 +22,23 @@ export type Replacement = {
    * ('use client/server') even when they live inside an otherwise-pruned body.
    */
   keepIf?: RegExp;
+  /**
+   * Token used instead when the block is the body of a control-flow
+   * statement (`if`/`try`/`catch`/loops — parent type ending in
+   * `statement`/`clause`) or an arrow function, where a bare comment would
+   * leave the construct without a body and the skeleton unparseable.
+   */
+  bracedToken?: string;
+  /** Only prune captures at least this many characters long. */
+  minLength?: number;
+  /** Skip captures of these node types (another rule already handles them). */
+  skipNodeTypes?: string[];
+  /**
+   * Comment rule: doc comments (`/**`, `///`, `//!`) are compressed to their
+   * summary + key tags, other comments are dropped (whole line when alone on
+   * it). `token` is ignored.
+   */
+  comment?: boolean;
 };
 
 export interface LanguageSpec {
@@ -45,7 +62,10 @@ export interface LanguageSpec {
 // Pruning workhorse: prune every `statement_block` / `block` node.
 // ---------------------------------------------------------------------------
 
-const BLOCK = { query: '(statement_block) @block', replacement: { token: '/* ... */' } };
+const BLOCK = {
+  query: '(statement_block) @block',
+  replacement: { token: '/* ... */', bracedToken: '{ /* ... */ }' },
+};
 const SWIFT_BLOCK = { query: '(statements) @block', replacement: { token: '/* ... */' } };
 const GO_BLOCK = { query: '(block) @block', replacement: { token: '/* ... */' } };
 const RUST_BLOCK = { query: '(block) @block', replacement: { token: '/* ... */' } };
@@ -62,9 +82,37 @@ const PHP_BLOCK = {
 const KOTLIN_BLOCK = { query: '(block) @block', replacement: { token: '/* ... */' } };
 const DART_BLOCK = { query: '(block) @block', replacement: { token: '/* ... */' } };
 
+// `const f = (x) => x * 2 + …`: expression bodies have no statement_block.
+const ARROW_EXPR = {
+  query: '(arrow_function body: (_) @body)',
+  replacement: { token: '{ /* ... */ }', minLength: 40, skipNodeTypes: ['statement_block'] },
+};
+
+// Large top-level object/array initializers (config tables, fixtures).
+const LITERAL_MIN = 200;
+const topLevelLiteral = (node: string) =>
+  `(program (lexical_declaration (variable_declarator value: (${node}) @lit)))\n` +
+  `(export_statement (lexical_declaration (variable_declarator value: (${node}) @lit)))`;
+const OBJECT_LITERAL = {
+  query: topLevelLiteral('object'),
+  replacement: { token: '{ /* ... */ }', minLength: LITERAL_MIN },
+};
+const ARRAY_LITERAL = {
+  query: topLevelLiteral('array'),
+  replacement: { token: '[ /* ... */ ]', minLength: LITERAL_MIN },
+};
+
+const COMMENT = { query: '(comment) @comment', replacement: { token: '', comment: true } };
+const LINE_BLOCK_COMMENT = {
+  query: '[(line_comment) (block_comment)] @comment',
+  replacement: { token: '', comment: true },
+};
+const JS_EXTRAS = [ARROW_EXPR, OBJECT_LITERAL, ARRAY_LITERAL, COMMENT];
+
 // Keeps `'use client'`/`'use server'` and top-level directive strings.
 const DIRECTIVE_KEEP: Replacement = {
   token: '/* ... */',
+  bracedToken: '{ /* ... */ }',
   keepIf: /^\s*'use (client|server)'/,
 };
 
@@ -74,35 +122,35 @@ export const registry: Record<string, LanguageSpec> = {
     wasm: 'tree-sitter-typescript.wasm',
     url: 'https://github.com/tree-sitter/tree-sitter-typescript/releases/latest/download/tree-sitter-typescript.wasm',
     extensions: ['.ts', '.cts', '.mts'],
-    rules: [BLOCK],
+    rules: [BLOCK, ...JS_EXTRAS],
   },
   javascript: {
     name: 'JavaScript',
     wasm: 'tree-sitter-javascript.wasm',
     url: 'https://github.com/tree-sitter/tree-sitter-javascript/releases/latest/download/tree-sitter-javascript.wasm',
     extensions: ['.js', '.cjs', '.mjs'],
-    rules: [BLOCK],
+    rules: [BLOCK, ...JS_EXTRAS],
   },
   tsx: {
     name: 'React / Next.js (TSX)',
     wasm: 'tree-sitter-tsx.wasm',
     url: 'https://github.com/tree-sitter/tree-sitter-typescript/releases/latest/download/tree-sitter-tsx.wasm',
     extensions: ['.tsx'],
-    rules: [{ query: '(statement_block) @block', replacement: DIRECTIVE_KEEP }],
+    rules: [{ query: '(statement_block) @block', replacement: DIRECTIVE_KEEP }, ...JS_EXTRAS],
   },
   jsx: {
     name: 'React (JSX)',
     wasm: 'tree-sitter-javascript.wasm',
     url: 'https://github.com/tree-sitter/tree-sitter-javascript/releases/latest/download/tree-sitter-javascript.wasm',
     extensions: ['.jsx'],
-    rules: [{ query: '(statement_block) @block', replacement: DIRECTIVE_KEEP }],
+    rules: [{ query: '(statement_block) @block', replacement: DIRECTIVE_KEEP }, ...JS_EXTRAS],
   },
   python: {
     name: 'Python',
     wasm: 'tree-sitter-python.wasm',
     url: 'https://github.com/tree-sitter/tree-sitter-python/releases/latest/download/tree-sitter-python.wasm',
     extensions: ['.py', '.pyi'],
-    rules: [PY_BLOCK],
+    rules: [PY_BLOCK, COMMENT],
   },
   dart: {
     name: 'Dart / Flutter',
@@ -123,21 +171,21 @@ export const registry: Record<string, LanguageSpec> = {
     wasm: 'tree-sitter-go.wasm',
     url: 'https://github.com/tree-sitter/tree-sitter-go/releases/latest/download/tree-sitter-go.wasm',
     extensions: ['.go'],
-    rules: [GO_BLOCK],
+    rules: [GO_BLOCK, COMMENT],
   },
   rust: {
     name: 'Rust',
     wasm: 'tree-sitter-rust.wasm',
     url: 'https://github.com/tree-sitter/tree-sitter-rust/releases/latest/download/tree-sitter-rust.wasm',
     extensions: ['.rs'],
-    rules: [RUST_BLOCK],
+    rules: [RUST_BLOCK, LINE_BLOCK_COMMENT],
   },
   java: {
     name: 'Java',
     wasm: 'tree-sitter-java.wasm',
     url: 'https://github.com/tree-sitter/tree-sitter-java/releases/latest/download/tree-sitter-java.wasm',
     extensions: ['.java'],
-    rules: [JAVA_BLOCK],
+    rules: [JAVA_BLOCK, LINE_BLOCK_COMMENT],
   },
   kotlin: {
     name: 'Kotlin',
@@ -151,21 +199,21 @@ export const registry: Record<string, LanguageSpec> = {
     wasm: 'tree-sitter-c.wasm',
     url: 'https://github.com/tree-sitter/tree-sitter-c/releases/latest/download/tree-sitter-c.wasm',
     extensions: ['.c', '.h'],
-    rules: [C_BLOCK],
+    rules: [C_BLOCK, COMMENT],
   },
   cpp: {
     name: 'C++',
     wasm: 'tree-sitter-cpp.wasm',
     url: 'https://github.com/tree-sitter/tree-sitter-cpp/releases/latest/download/tree-sitter-cpp.wasm',
     extensions: ['.cc', '.cpp', '.cxx', '.hpp', '.hh', '.hxx'],
-    rules: [C_BLOCK],
+    rules: [C_BLOCK, COMMENT],
   },
   php: {
     name: 'PHP',
     wasm: 'tree-sitter-php.wasm',
     url: 'https://github.com/tree-sitter/tree-sitter-php/releases/latest/download/tree-sitter-php.wasm',
     extensions: ['.php'],
-    rules: [PHP_BLOCK],
+    rules: [PHP_BLOCK, COMMENT],
   },
 } satisfies Record<string, LanguageSpec>;
 

@@ -5,3 +5,4 @@ dist
 # Auto-downloaded tree-sitter WASM binaries
 wasm/*.wasm
 .prd.md
+.token-shrink/

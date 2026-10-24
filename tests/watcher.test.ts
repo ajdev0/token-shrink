@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createWatcher } from '../src/watcher/sync.js';
+import { createWatcher, resolveImport } from '../src/watcher/sync.js';
 
 const dirs: string[] = [];
 const watchers: ReturnType<typeof createWatcher>[] = [];
@@ -62,5 +62,16 @@ describe('watcher safety', () => {
       return original(p, options);
     }) as typeof fs.promises.readdir);
     await expect(w.indexAll()).resolves.toBe(0);
+  });
+});
+
+describe('TypeScript ESM .js specifiers', () => {
+  it('resolves ./x.js to x.ts and ./x.mjs to x.mts', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-esm-'));
+    fs.writeFileSync(path.join(dir, 'util.ts'), 'export const u = 1;\n');
+    fs.writeFileSync(path.join(dir, 'mod.mts'), 'export const m = 1;\n');
+    const importer = path.join(dir, 'main.ts');
+    expect(resolveImport(importer, './util.js', dir)).toBe(path.join(dir, 'util.ts'));
+    expect(resolveImport(importer, './mod.mjs', dir)).toBe(path.join(dir, 'mod.mts'));
   });
 });

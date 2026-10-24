@@ -74,16 +74,34 @@ export function loadLanguage(
 }
 
 /**
- * Replace all ranges with their tokens. Ranges are pre-sorted descending by
- * start offset so each splice happens at the tail of the string first,
- * keeping earlier offsets stable.
+ * Drop ranges nested inside (or overlapping) an earlier kept range. Splicing
+ * an inner range first would leave the outer range's offsets stale.
+ */
+export function outermostRanges(ranges: PruneRange[]): PruneRange[] {
+  const byStart = [...ranges].sort(
+    (a, b) => a.start - b.start || b.end - a.end,
+  );
+  const kept: PruneRange[] = [];
+  for (const r of byStart) {
+    const last = kept[kept.length - 1];
+    if (last && r.start < last.end) continue;
+    kept.push(r);
+  }
+  return kept;
+}
+
+/**
+ * Replace all ranges with their tokens. Nested ranges are collapsed into
+ * their outermost range, then spliced descending by start offset so each
+ * splice happens at the tail of the string first, keeping earlier offsets
+ * stable.
  */
 export function spliceRanges(source: string, ranges: PruneRange[]): {
   code: string;
   removed: number;
 } {
   let removed = 0;
-  const sorted = [...ranges].sort((a, b) => b.start - a.start);
+  const sorted = outermostRanges(ranges).reverse();
   let out = source;
   for (const r of sorted) {
     if (r.start < 0 || r.end > out.length || r.end < r.start) continue;
@@ -164,29 +182,53 @@ export async function analyze(
     ];
     const isProtected = (start: number, end: number) =>
       keepRanges.some((k) => k.start <= start && end <= k.end);
+    const annotationRe = annotationRegExp(opts.preserveAnnotations ?? []);
 
     const ranges: PruneRange[] = [];
     for (const rule of spec.rules) {
-      const query = language.query(rule.query);
+      const { replacement } = rule;
+      let query: Parser.Query;
+      try {
+        query = language.query(rule.query);
+      } catch {
+        continue; // node type missing from this grammar version — skip the rule
+      }
       const captures = query.captures(tree.rootNode);
       for (const cap of captures) {
+        const { startIndex: start, endIndex: end } = cap.node;
         // Skip captures whose source text is empty (there's nothing to shrink).
-        if (cap.node.startIndex === cap.node.endIndex) continue;
+        if (start === end) continue;
+        if (replacement.minLength && end - start < replacement.minLength) continue;
+        if (replacement.skipNodeTypes?.includes(cap.node.type)) continue;
         // Allow rules to keep certain blocks (e.g. 'use client/server').
-        if (rule.replacement.keepIf?.test(cap.node.text)) continue;
+        if (replacement.keepIf?.test(cap.node.text)) continue;
         // Config keep-rules (preserveAnnotations / keepBlocksInside).
-        if (isProtected(cap.node.startIndex, cap.node.endIndex)) continue;
+        if (isProtected(start, end)) continue;
+        if (replacement.comment) {
+          if (annotationRe?.test(cap.node.text)) continue;
+          const range = commentRange(source, start, end);
+          if (range) ranges.push(range);
+          continue;
+        }
+        const braced =
+          replacement.bracedToken !== undefined &&
+          /(statement|clause)$|^arrow_function$/.test(cap.node.parent?.type ?? '');
         ranges.push({
-          start: cap.node.startIndex,
-          end: cap.node.endIndex,
-          token: rule.replacement.token,
+          start,
+          end,
+          token: braced ? replacement.bracedToken! : replacement.token,
         });
       }
       query.delete();
     }
 
     const { code, removed } = spliceRanges(source, ranges);
-    return { code, language: spec.name, removed, symbols };
+    return {
+      code: ranges.length > 0 ? normalizeWhitespace(code) : code,
+      language: spec.name,
+      removed,
+      symbols,
+    };
   } finally {
     tree.delete();
     parser.delete();
@@ -217,10 +259,8 @@ function annotatedKeepRanges(
   source: string,
   annotations: string[],
 ): { start: number; end: number }[] {
-  if (annotations.length === 0) return [];
-  const markers = annotations.filter(Boolean).map(escapeRegExp);
-  if (markers.length === 0) return [];
-  const re = new RegExp(`@(${markers.join('|')})\\b`, 'i');
+  const re = annotationRegExp(annotations);
+  if (!re) return [];
   return symbols
     .filter((s) => {
       // Look at the slice of source right before the definition. Cut everything
@@ -234,6 +274,69 @@ function annotatedKeepRanges(
       return re.test(relevant);
     })
     .map((s) => ({ start: s.start, end: s.end }));
+}
+
+/** `@marker` matcher for the configured annotations, or null when none. */
+function annotationRegExp(annotations: string[]): RegExp | null {
+  const markers = annotations.filter(Boolean).map(escapeRegExp);
+  if (markers.length === 0) return null;
+  return new RegExp(`@(${markers.join('|')})\\b`, 'i');
+}
+
+/** Doc tags worth keeping when a JSDoc-style comment is compressed. */
+const KEPT_DOC_TAGS = /^@(param|returns?|throws|deprecated|template|typeParam)\b/;
+/** Longest summary / tag line kept from a doc comment. */
+const DOC_LINE_MAX = 100;
+
+const clip = (text: string) =>
+  text.length > DOC_LINE_MAX ? `${text.slice(0, DOC_LINE_MAX - 1).trimEnd()}…` : text;
+
+/**
+ * Compress a comment for a skeleton: `/** … *\/` docs keep their first
+ * sentence plus key `@tags` on one line; `///` / `//!` docs and TS
+ * `/// <reference>` directives are kept as-is; everything else is dropped.
+ */
+export function compressComment(text: string): string {
+  if (/^\/\/[/!]/.test(text)) return text;
+  if (!text.startsWith('/**')) return '';
+  const lines = text
+    .replace(/^\/\*\*+/, '')
+    .replace(/\*+\/$/, '')
+    .split('\n')
+    .map((l) => l.replace(/^\s*\*?\s?/, '').trim());
+  const tagStart = lines.findIndex((l) => l.startsWith('@'));
+  const prose = (tagStart === -1 ? lines : lines.slice(0, tagStart))
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const summary = prose.match(/^.*?[.!?](?=\s|$)/)?.[0] ?? prose;
+  const tags = (tagStart === -1 ? [] : lines.slice(tagStart)).filter((l) =>
+    KEPT_DOC_TAGS.test(l),
+  );
+  const parts = [summary, ...tags].filter(Boolean).map(clip);
+  return parts.length > 0 ? `/** ${parts.join(' ')} */` : '';
+}
+
+/**
+ * Prune range for a comment. A dropped comment that is alone on its line
+ * takes the whole line (and its newline) with it.
+ */
+function commentRange(source: string, start: number, end: number): PruneRange | null {
+  const token = compressComment(source.slice(start, end));
+  if (token === source.slice(start, end)) return null;
+  if (token !== '') return { start, end, token };
+  const lineStart = source.lastIndexOf('\n', start - 1) + 1;
+  const nl = source.indexOf('\n', end);
+  const lineEnd = nl === -1 ? source.length : nl + 1;
+  const aloneOnLine =
+    source.slice(lineStart, start).trim() === '' &&
+    source.slice(end, nl === -1 ? source.length : nl).trim() === '';
+  return aloneOnLine ? { start: lineStart, end: lineEnd, token: '' } : { start, end, token: '' };
+}
+
+/** Trim trailing spaces and collapse runs of blank lines left by pruning. */
+function normalizeWhitespace(code: string): string {
+  return code.replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n');
 }
 
 function escapeRegExp(text: string): string {

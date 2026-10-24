@@ -83,7 +83,7 @@ describe('prune (downloads grammar on first run)', () => {
     expect(res.code).toContain('id: number;');
     // Function bodies replaced by the block token.
     expect(res.code).toContain('export function greet(u: User) /* ... */');
-    expect(res.code).toContain('export const add = (a: number, b: number) => /* ... */');
+    expect(res.code).toContain('export const add = (a: number, b: number) => { /* ... */ }');
     // Signature line intact for exported members.
     expect(res.code).toMatch(/export function greet\(u: User\)/);
     // Meaningful reduction.
@@ -111,5 +111,108 @@ describe('prune (downloads grammar on first run)', () => {
     const before = tokenCount(source);
     const after = tokenCount(code);
     expect(after).toBeLessThan(before * 0.5); // at least 50% fewer tokens
+  });
+});
+
+describe('nested blocks', () => {
+  it('splices only the outermost range when ranges nest', () => {
+    // Inner token is longer than the text it replaces; stale outer offsets
+    // used to cut into the trailing code.
+    const { code, removed } = spliceRanges('ab{c{d}e}fg', [
+      { start: 2, end: 9, token: '#' },
+      { start: 4, end: 7, token: '/* ... */' },
+    ]);
+    expect(code).toBe('ab#fg');
+    expect(removed).toBe(7);
+  });
+
+  it('keeps code after a function whose body has nested blocks', async () => {
+    const source = [
+      'export function foo(a: number): number {',
+      '  if (a) { return 1; }',
+      '  for (const x of [1]) { if (x) { a++; } }',
+      '  return 2;',
+      '}',
+      'export function bar(b: string): string {',
+      '  return b;',
+      '}',
+      'export const tail = 1;',
+    ].join('\n');
+    const { code } = await prune('/tmp/nested.ts', source);
+    expect(code).toBe(
+      [
+        'export function foo(a: number): number /* ... */',
+        'export function bar(b: string): string /* ... */',
+        'export const tail = 1;',
+      ].join('\n'),
+    );
+  });
+});
+
+describe('extra shrinking passes (TypeScript)', () => {
+  it('collapses long expression-bodied arrows but keeps short ones', async () => {
+    const source = [
+      'export const short = (x: number) => x * 2;',
+      'export const long = (u: { name: string; email: string }) => [u.name, u.email.toLowerCase().trim()].join(" | ");',
+    ].join('\n');
+    const { code } = await prune('/tmp/arrow.ts', source);
+    expect(code).toContain('export const short = (x: number) => x * 2;');
+    expect(code).toContain('export const long = (u: { name: string; email: string }) => { /* ... */ };');
+  });
+
+  it('collapses large top-level literals and keeps their type annotation', async () => {
+    const rows = Array.from({ length: 30 }, (_, i) => `  k${i}: ${i},`).join('\n');
+    const source = [
+      `export const TABLE: Record<string, number> = {\n${rows}\n};`,
+      'export const SMALL = { a: 1 };',
+      `const LIST = [${Array.from({ length: 60 }, (_, i) => i).join(', ')}];`,
+      'export const KEYS = { a: 1, b: 2 } as const;',
+    ].join('\n');
+    const { code } = await prune('/tmp/literal.ts', source);
+    expect(code).toContain('export const TABLE: Record<string, number> = { /* ... */ };');
+    expect(code).toContain('export const SMALL = { a: 1 };');
+    expect(code).toContain('const LIST = [ /* ... */ ];');
+    expect(code).toContain('export const KEYS = { a: 1, b: 2 } as const;');
+  });
+
+  it('compresses doc comments and drops plain comments', async () => {
+    const source = [
+      '/// <reference types="node" />',
+      '// a plain note that costs tokens',
+      '/**',
+      ' * Build the greeting. Joins the name and email',
+      ' * with a pipe and lower-cases everything.',
+      ' *',
+      ' * @param u the user',
+      ' * @example greet(u)',
+      ' * @returns the greeting',
+      ' */',
+      'export function greet(u: string): string {',
+      '  return u;',
+      '}',
+      'export const x = 1; // trailing note',
+    ].join('\n');
+    const { code } = await prune('/tmp/comments.ts', source);
+    expect(code).toBe(
+      [
+        '/// <reference types="node" />',
+        '/** Build the greeting. @param u the user @returns the greeting */',
+        'export function greet(u: string): string /* ... */',
+        'export const x = 1;',
+      ].join('\n'),
+    );
+  });
+
+  it('keeps comments that carry a preserveAnnotations marker', async () => {
+    const { analyze } = await import('../src/parser/analyze.js');
+    const source = '// @api\nexport function keep() {\n  return 1;\n}\n// drop me\nexport const y = 2;\n';
+    const { code } = await analyze('/tmp/annot.ts', source, { preserveAnnotations: ['api'] });
+    expect(code).toBe('// @api\nexport function keep() {\n  return 1;\n}\nexport const y = 2;\n');
+  });
+
+  it('collapses blank-line runs left behind by pruning', async () => {
+    const source = 'export const a = 1;\n\n// gone\n\n\nexport const b = 2;   \n';
+    const { code } = await prune('/tmp/ws.ts', source);
+    expect(code).toBe('export const a = 1;\n\nexport const b = 2;\n');
   });
 });

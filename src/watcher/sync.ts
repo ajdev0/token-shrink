@@ -21,6 +21,7 @@ import { ensureParserInit } from '../parser/pruner.js';
 import { analyze } from '../parser/analyze.js';
 import type { SymbolInfo } from '../parser/symbols.js';
 import { matchesAny, type TokenShrinkConfig } from '../config.js';
+import { approximateTokens } from '../tokens.js';
 
 export type { Matcher };
 
@@ -42,6 +43,8 @@ export interface CacheEntry {
   imports: string[];
   /** Named definitions found while indexing (for expand_symbol / search). */
   symbols?: SymbolInfo[];
+  /** Approximate tokens of the full, un-pruned source (savings baseline). */
+  originalTokens?: number;
 }
 
 export type GraphCache = Map<string, CacheEntry>;
@@ -122,10 +125,22 @@ export function resolveImport(
   return resolveCandidate(path.resolve(base, specifier));
 }
 
+/**
+ * TypeScript ESM imports name the emitted file (`./x.js`) while the source is
+ * `./x.ts`; map a JS extension to its TS counterparts.
+ */
+export function tsSourcesFor(p: string): string[] {
+  const m = /\.(m|c)?js(x)?$/.exec(p);
+  if (!m) return [];
+  const stem = p.slice(0, m.index);
+  return m[2] ? [`${stem}.tsx`] : [`${stem}.${m[1] ?? ''}ts`, `${stem}.tsx`];
+}
+
 /** Try a specifier with common extension/index additions. */
 function resolveCandidate(p: string): string | null {
   const candidates = [
     p,
+    ...tsSourcesFor(p),
     `${p}.ts`,
     `${p}.tsx`,
     `${p}.js`,
@@ -226,6 +241,7 @@ export function createWatcher(opts: SyncOptions) {
       hash,
       skeleton: code,
       language,
+      originalTokens: approximateTokens(source),
       imports: imports
         .map((spec) => resolveImport(abs, spec, root))
         .filter((p): p is string => p !== null),

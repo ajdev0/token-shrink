@@ -29,7 +29,7 @@ A **local-first, framework-aware token reduction engine** — a polyglot AST sem
 Pipeline stages:
 
 1. **Parse** — `web-tree-sitter` loads a `.wasm` grammar per language (auto-downloaded on first run).
-2. **Prune** — an S-expression query matches implementation blocks (`statement_block`, `block`, `compound_statement`…), which are replaced with a short token (`/* ... */`, or `pass` for Python) using **descending-order splicing** so offsets stay valid.
+2. **Prune** — an S-expression query matches implementation blocks (`statement_block`, `block`, `compound_statement`…), which are replaced with a short token (`/* ... */`, or `pass` for Python) using **descending-order splicing** so offsets stay valid (nested blocks collapse into their outermost one). For TS/JS, long expression-bodied arrows and large (200+ char) top-level object/array literals are collapsed too, doc comments are shortened to their first sentence plus `@param`/`@returns`, plain comments are dropped, and blank-line runs are squeezed.
 3. **Watch** — `chokidar` watches the repo, `sha1`-hashes file contents, and refreshes the cache only on change.
 4. **Assemble** — the active file's imports are resolved and merged into a Markdown context payload (Ring 0 + Ring 1).
 
@@ -277,6 +277,25 @@ await watcher.indexAll();
 
 
 
+## See your savings
+
+Every context call is measured against what the same files would cost un-pruned, and the result is printed **in yellow**:
+
+```text
+⚡ token-shrink: 10,645 → 4,263 tokens (−6,382 · 60% saved)
+```
+
+- **Claude Code status line**: copy `hooks/claude/statusline.mjs` and merge the `statusLine` block from `hooks/claude/settings.example.json` (see `hooks/claude/README.md`). Shows the last call and the session total.
+- **HTTP server**: logged after each `POST /v1/context`. `tokenStats` in the response also carries `originalTokens`, `savedTokens` and `reductionPct`.
+- **MCP server**: written to stderr (visible in `claude --debug` / Cursor's MCP log). The model-facing `[stats]` line gets a plain `original=… saved=… (…%)` suffix.
+- **Any time**: `token-shrink stats --root /path/to/project` prints the last call, the session and the all-time totals.
+
+Totals live in `<root>/.token-shrink/stats.json` (add it to `.gitignore`). Disable with `--no-stats` or `TOKEN_SHRINK_STATS=0`. Color follows the terminal; `FORCE_COLOR=1` / `NO_COLOR=1` override it.
+
+---
+
+
+
 ## Supported languages
 
 S-expression queries match implementation blocks; interfaces, signatures, and exports are never touched. The `Block node` column shows the AST node that gets collapsed during pruning.
@@ -334,7 +353,7 @@ export interface User {
   name: string;
 }
 export function buildGreeting(u: User) /* ... */
-export const formatEmail = (u: User) => /* ... */;
+export const formatEmail = (u: User) => { /* ... */ };
 ```
 
 ---

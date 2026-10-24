@@ -6,7 +6,7 @@
  * (HTTP) and `./mcp.js` (MCP stdio), which are the packaged CLIs.
  */
 
-export { prune, spliceRanges, analyze, ensureParserInit, loadLanguage } from './parser/analyze.js';
+export { prune, spliceRanges, outermostRanges, analyze, ensureParserInit, loadLanguage } from './parser/analyze.js';
 export type { AnalyzeOptions, AnalyzeResult, PruneRange } from './parser/analyze.js';
 export { collectSymbols, matchSymbols } from './parser/symbols.js';
 export type { SymbolInfo, SymbolKind } from './parser/symbols.js';
@@ -59,4 +59,13 @@ export {
 } from './mcp.js';
 export type { McpServerOptions, RuleWriteResult, RuleTarget } from './mcp.js';
 
-export const version = '2.0.0';
+export { VERSION as version } from './tokens.js';
+export {
+  formatSavings,
+  readStats,
+  recordSavings,
+  savingsOf,
+  statsPathFor,
+} from './tokens.js';
+export type { Savings, StatsFile } from './tokens.js';
+export { printStats } from './cli.js';

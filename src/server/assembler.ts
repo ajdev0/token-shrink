@@ -12,7 +12,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import type { GraphCache } from '../watcher/sync.js';
+import { tsSourcesFor, type GraphCache } from '../watcher/sync.js';
+import { approximateTokens, savingsOf } from '../tokens.js';
+
+export { approximateTokens } from '../tokens.js';
 
 export interface AssembleOptions {
   /** Number of PRD-style stats to append (disabled by default). */
@@ -34,6 +37,15 @@ export interface TokenStats {
   activeTokens: number;
   dependencyTokens: number;
   totalTokens: number;
+  /**
+   * Tokens the same files would cost un-pruned (Ring 0 as emitted + the full
+   * source of every included Ring-1 file): the savings baseline.
+   */
+  originalTokens: number;
+  /** `originalTokens - totalTokens`. */
+  savedTokens: number;
+  /** Percentage of `originalTokens` saved, one decimal. */
+  reductionPct: number;
   /** When `maxTokens` was supplied, the budget that was enforced. */
   budget?: number;
   /** Number of Ring 1 candidates dropped by the token budget. */
@@ -153,6 +165,7 @@ export function assembleMany(
   const selected: AssembleResult['included'] = [];
   let trimmed = 0;
   let dependencyTokens = 0;
+  let dependencyOriginalTokens = 0;
   for (const cand of ordered) {
     if (selected.length >= maxSkeletons) break;
     const entry = cache.get(cand.filePath);
@@ -164,11 +177,23 @@ export function assembleMany(
     }
     selected.push(cand);
     dependencyTokens += cost;
+    dependencyOriginalTokens += entry?.originalTokens ?? cost;
   }
   const activeTokens = ring0Texts.reduce(
     (acc, t) => acc + approximateTokens(t),
     0,
   );
+  // Ring 0 baseline is the full source, even when it was pruned on request.
+  const activeOriginalTokens = sources.reduce(
+    (acc, t) => acc + approximateTokens(t),
+    0,
+  );
+  const totalTokens = activeTokens + dependencyTokens;
+  const originalTokens = Math.max(
+    totalTokens,
+    activeOriginalTokens + dependencyOriginalTokens,
+  );
+  const savings = savingsOf({ originalTokens, totalTokens });
 
   const lines: string[] = [];
   lines.push('# Compressed Code Context', '');
@@ -233,7 +258,8 @@ export function assembleMany(
     lines.push(
       '---',
       '',
-      `_Token estimate — active: ${activeTokens} · pruned deps: ${dependencyTokens}${budgetNote}._`,
+      `_Token estimate — active: ${activeTokens} · pruned deps: ${dependencyTokens} · ` +
+        `original: ${originalTokens} · saved: ${savings.savedTokens} (${savings.reductionPct}%)${budgetNote}._`,
       '',
     );
   }
@@ -248,7 +274,9 @@ export function assembleMany(
     tokenStats: {
       activeTokens,
       dependencyTokens,
-      totalTokens: activeTokens + dependencyTokens,
+      totalTokens,
+      originalTokens,
+      ...savings,
       ...(maxTokens !== undefined ? { budget: maxTokens } : {}),
       trimmed,
     },
@@ -316,6 +344,7 @@ function resolveLocal(importer: string, specifier: string): string | null {
   const p = path.resolve(base, specifier);
   const candidates = [
     p,
+    ...tsSourcesFor(p),
     `${p}.ts`,
     `${p}.tsx`,
     `${p}.js`,
@@ -352,13 +381,6 @@ function rel(p: string): string {
 /** Return a code-block language label for a file path. */
 function ext(p: string): string {
   return path.extname(p).replace(/^\./, '') || 'text';
-}
-
-/** Rough, dependency-free token approximation (words + punctuation runs). */
-export function approximateTokens(text: string): number {
-  if (!text) return 0;
-  const tokens = text.match(/[A-Za-z0-9_$]+|[^A-Za-z0-9_\s$]/g);
-  return tokens ? tokens.length : 0;
 }
 
 export function assembleFromCache(

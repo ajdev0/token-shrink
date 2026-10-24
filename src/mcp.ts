@@ -32,6 +32,15 @@ import {
   EMPTY_CONFIG,
   type TokenShrinkConfig,
 } from './config.js';
+import {
+  approximateTokens,
+  formatSavings,
+  recordSavings,
+  savingsOf,
+  wantsColor,
+  VERSION,
+  type Savings,
+} from './tokens.js';
 
 /** Watcher handle shape returned by `createWatcher`. */
 type WatcherHandle = ReturnType<typeof createWatcher>;
@@ -162,6 +171,11 @@ export interface McpServerOptions {
   createRule?: boolean;
   /** Which agent rule target(s) to write. Default all. */
   ruleTarget?: RuleTarget | RuleTarget[];
+  /**
+   * Persist per-call token savings to `<root>/.token-shrink/stats.json`
+   * (read by `token-shrink stats` and the status line). Default true.
+   */
+  recordStats?: boolean;
 }
 
 export interface RuleWriteResult {
@@ -259,6 +273,19 @@ export async function startMcpServer(opts: McpServerOptions = {}): Promise<McpSe
   const textReply = (text: string) => ({
     content: [{ type: 'text' as const, text }],
   });
+  // Show the user what a call saved (yellow on stderr) and persist it for
+  // `token-shrink stats` / the Claude Code status line.
+  const sessionStartedAt = new Date().toISOString();
+  const reportSavings = (tool: string, s: Savings) => {
+    if (!opts.silent) {
+      process.stderr.write(`${formatSavings(s, { color: wantsColor() })}\n`);
+    }
+    if (root && opts.recordStats !== false) recordSavings(root, tool, s, sessionStartedAt);
+  };
+  const savingsNote = (s: Savings) => {
+    const { savedTokens, reductionPct } = savingsOf(s);
+    return ` original=${s.originalTokens} saved=${savedTokens} (${reductionPct}%)`;
+  };
 
   // ---------------------------------------------------------------------------
   // Root + watcher lifecycle. An explicit root (--root / ROOT env) warms up
@@ -420,7 +447,7 @@ export async function startMcpServer(opts: McpServerOptions = {}): Promise<McpSe
     });
 
   const server = new McpServer(
-    { name: 'token-shrink', version: '2.0.0' },
+    { name: 'token-shrink', version: VERSION },
     { capabilities: { tools: {} } },
   );
 
@@ -479,6 +506,7 @@ export async function startMcpServer(opts: McpServerOptions = {}): Promise<McpSe
       const ts = result.tokenStats;
       const budgetNote =
         ts.budget !== undefined ? ` budget=${ts.budget} trimmed=${ts.trimmed}` : '';
+      reportSavings('get_compressed_code_context', ts);
       return {
         content: [
           {
@@ -490,7 +518,7 @@ export async function startMcpServer(opts: McpServerOptions = {}): Promise<McpSe
             text:
               `[stats] files=${result.activeFilePaths.length} ` +
               `dependencies=${result.included.length} unresolved=${result.unresolved.length} ` +
-              `tokens=${ts.totalTokens}${budgetNote}`,
+              `tokens=${ts.totalTokens}${savingsNote(ts)}${budgetNote}`,
           },
         ],
       };
@@ -686,6 +714,8 @@ export async function startMcpServer(opts: McpServerOptions = {}): Promise<McpSe
       const importerCap = maxImporters ?? 20;
       const importers = importerList.slice(0, importerCap);
       const importersTruncated = importerList.length > importers.length;
+      let importerTokens = 0;
+      let importerOriginalTokens = 0;
 
       const relLabel = (abs: string) => {
         const rel = path.relative(repoRoot, abs);
@@ -740,6 +770,13 @@ export async function startMcpServer(opts: McpServerOptions = {}): Promise<McpSe
 
       if (importers.length > 0) {
         parts.push(`## Ring 2 — Files importing the diff (${importers.length})`, '');
+        for (const abs of importers) {
+          const entry = watcher.cache.entries.get(abs);
+          if (!entry) continue;
+          const cost = approximateTokens(entry.skeleton);
+          importerTokens += cost;
+          importerOriginalTokens += entry.originalTokens ?? cost;
+        }
         parts.push('', 'Pruned skeletons of modules that call into the changed files.', '');
         for (const abs of importers) {
           const entry = watcher.cache.entries.get(abs);
@@ -774,9 +811,15 @@ export async function startMcpServer(opts: McpServerOptions = {}): Promise<McpSe
       const ts = assembled.tokenStats;
       const budgetNote =
         ts.budget !== undefined ? ` budget=${ts.budget} trimmed=${ts.trimmed}` : '';
+      const gitSavings: Savings = {
+        originalTokens: ts.originalTokens + importerOriginalTokens,
+        totalTokens: ts.totalTokens + importerTokens,
+      };
+      reportSavings('git_diff_context', gitSavings);
       const stats =
         `[git-stats] files=${changed.length} ring1=${assembled.included.length} ` +
-        `importers=${importers.length} unresolved=${assembled.unresolved.length} tokens=${ts.totalTokens}${budgetNote}`;
+        `importers=${importers.length} unresolved=${assembled.unresolved.length} ` +
+        `tokens=${gitSavings.totalTokens}${savingsNote(gitSavings)}${budgetNote}`;
       return {
         content: [
           { type: 'text' as const, text: parts.join('\n') },
@@ -891,7 +934,12 @@ if (invokedAsMcp) {
           (v): v is RuleTarget => v === 'cursor' || v === 'claude' || v === 'cline',
         ) as RuleTarget[])
       : undefined;
-  void startMcpServer({ root: rootArg, createRule, ruleTarget }).catch((err) => {
+  const recordStats = !(
+    process.env.TOKEN_SHRINK_STATS === '0' ||
+    process.env.TOKEN_SHRINK_STATS === 'false' ||
+    process.argv.includes('--no-stats')
+  );
+  void startMcpServer({ root: rootArg, createRule, ruleTarget, recordStats }).catch((err) => {
     process.stderr.write(`[token-shrink] MCP server error: ${err.message}\n`);
     process.exitCode = 1;
   });

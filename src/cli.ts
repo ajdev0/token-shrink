@@ -16,6 +16,14 @@ import path from 'node:path';
 import { assembleMany } from './server/assembler.js';
 import { createWatcher, type Matcher } from './watcher/sync.js';
 import { warmGrammars } from './parser/wasm.js';
+import {
+  formatSavings,
+  readStats,
+  recordSavings,
+  statsPathFor,
+  VERSION,
+  wantsColor,
+} from './tokens.js';
 
 export interface CliOptions {
   port?: number;
@@ -58,6 +66,7 @@ export async function startServer(opts: CliOptions = {}) {
   const log = (msg: string) => {
     if (!silent) console.log(picocolors.dim(msg));
   };
+  const sessionStartedAt = new Date().toISOString();
 
   // Warm grammars in the background so the first prune isn't slow.
   void warmGrammars().catch(() => {});
@@ -71,7 +80,7 @@ export async function startServer(opts: CliOptions = {}) {
   app.get('/health', async () => ({
     status: 'ok',
     service: 'token-shrink',
-    version: '2.0.0',
+    version: VERSION,
     root,
     indexed: watcher.cache.entries.size,
   }));
@@ -105,6 +114,8 @@ export async function startServer(opts: CliOptions = {}) {
       maxTokens: Number.isFinite(maxTokens as number) ? (maxTokens as number) : undefined,
       includeStats: body.includeStats,
     });
+    if (!silent) console.log(formatSavings(result.tokenStats, { color: wantsColor(process.stdout) }));
+    recordSavings(root, 'v1/context', result.tokenStats, sessionStartedAt);
     return {
       markdown: result.markdown,
       activeFilePath: result.activeFilePath,
@@ -138,14 +149,36 @@ try {
 } catch {
   /* path may not exist yet (tsx/dev runners) — fall back to argv basename */
 }
+/**
+ * `token-shrink stats [--root <dir>]`: print the last call, session and
+ * all-time savings recorded in `<root>/.token-shrink/stats.json`.
+ */
+export function printStats(root: string, out: (line: string) => void = console.log): boolean {
+  const stats = readStats(root);
+  if (!stats) {
+    out(picocolors.dim(`No token-shrink stats yet (${statsPathFor(root)}).`));
+    return false;
+  }
+  const color = wantsColor(process.stdout);
+  out(formatSavings(stats.last, { color, label: `last call (${stats.last.tool})` }));
+  out(formatSavings(stats.session, { color, label: `session · ${stats.session.calls} calls` }));
+  out(formatSavings(stats.allTime, { color, label: `all time · ${stats.allTime.calls} calls` }));
+  return true;
+}
+
 if (
   argv1 === 'cli.js' || argv1 === 'cli.mjs' ||
   argv1 === 'cli.cjs' || argv1 === 'cli.ts' ||
   argv1Real === 'cli.js' || argv1Real === 'cli.mjs' ||
   argv1Real === 'cli.cjs' || argv1Real === 'cli.ts'
 ) {
-  startServer().catch((err) => {
-    console.error(picocolors.red(`[token-shrink] ${err.message}`));
-    process.exitCode = 1;
-  });
+  if (process.argv[2] === 'stats') {
+    const args = parseArgv();
+    printStats(path.resolve(args.root ?? process.env.ROOT ?? process.cwd()));
+  } else {
+    startServer().catch((err) => {
+      console.error(picocolors.red(`[token-shrink] ${err.message}`));
+      process.exitCode = 1;
+    });
+  }
 }

@@ -1,7 +1,7 @@
 /**
  * MCP stdio server. Exposes a single tool:
  *
- *   get_compressed_code_context({ activeFilePath, maxSkeletons?, includeStats? })
+ *   get_compressed_code_context({ activeFilePath, maxSkeletons?, includeStats?, focusLines?, ringOneMode? })
  *
  * It maintains its own graph cache by watching the repository root derived
  * from the active file, so Cursor/Claude/Cline agents can request pruned context.
@@ -18,18 +18,25 @@ import { z } from 'zod';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { assembleMany } from './server/assembler.js';
+import { assembleContext, type ContextOptions } from './server/context.js';
 import { createWatcher, type Matcher } from './watcher/sync.js';
 import { detectProjectRoot } from './detect.js';
 import { languageForFile } from './parser/registry.js';
 import { analyze } from './parser/analyze.js';
 import { matchSymbols, type SymbolKind } from './parser/symbols.js';
 import { SymbolSearch } from './search/index.js';
-import { gitChangedFiles, type GitChangedOptions, type GitDiffScope } from './git.js';
+import {
+  gitChangedFiles,
+  gitChangedLines,
+  type GitChangedOptions,
+  type GitDiffScope,
+} from './git.js';
 import {
   loadConfig,
   configPathFor,
   EMPTY_CONFIG,
+  matchesAny,
+  type RingOneMode,
   type TokenShrinkConfig,
 } from './config.js';
 import {
@@ -62,7 +69,7 @@ export const RULE_TARGET_PATH = {
 } as const;
 
 /** Bump when the generated rule bodies gain new tool guidance. */
-export const RULE_VERSION = 3;
+export const RULE_VERSION = 4;
 /** Marker line inside generated rules; its presence means "current version". */
 export const RULE_VERSION_MARKER = `# token-shrink rule v${RULE_VERSION}`;
 
@@ -82,7 +89,8 @@ const WORKFLOW_GUIDANCE = [
   'git_diff_context and use its impact payload (changed files and their callers) as context.',
   '',
   'Pass activeFiles to get_compressed_code_context when a task spans several files, and',
-  'maxTokens whenever the payload must fit a token budget.',
+  'maxTokens whenever the payload must fit a token budget. When you know the line(s) you',
+  'are editing, pass focusLines so an over-budget active file keeps those definitions in full.',
 ].join('\n');
 
 /** Light guidance used when `.tokenshrinkrc` sets "autoWorkflow": false. */
@@ -282,6 +290,14 @@ export async function startMcpServer(opts: McpServerOptions = {}): Promise<McpSe
     }
     if (root && opts.recordStats !== false) recordSavings(root, tool, s, sessionStartedAt);
   };
+  // Config-driven pruning options shared by the context tools; a per-call
+  // `ringOneMode` overrides `.tokenshrinkrc.json`.
+  const contextOptions = (ringOneMode?: RingOneMode): ContextOptions => ({
+    ringOneMode: ringOneMode ?? config.ringOneMode ?? 'full',
+    preserveAnnotations: config.preserveAnnotations,
+    isKeepUnpruned: (abs) =>
+      config.keepUnpruned.length > 0 && matchesAny(path.relative(root, abs), config.keepUnpruned),
+  });
   const savingsNote = (s: Savings) => {
     const { savedTokens, reductionPct } = savingsOf(s);
     return ` original=${s.originalTokens} saved=${savedTokens} (${reductionPct}%)`;
@@ -488,9 +504,32 @@ export async function startMcpServer(opts: McpServerOptions = {}): Promise<McpSe
           .boolean()
           .optional()
           .describe('Append approximate token-count stats'),
+        focusLines: z
+          .union([z.array(z.number().int().positive()), z.record(z.array(z.number().int().positive()))])
+          .optional()
+          .describe(
+            '1-based lines you are working on (cursor / edit site). An array applies to ' +
+              '`activeFilePath`; with `activeFiles` pass { path: lines }. When Ring 0 alone ' +
+              'exceeds `maxTokens`, only the definitions around these lines keep their bodies.',
+          ),
+        ringOneMode: z
+          .enum(['used', 'full'])
+          .optional()
+          .describe(
+            "'used': dependency skeletons keep only the exports the active files import " +
+              "(plus types they reference). 'full': whole skeletons. Default from .tokenshrinkrc.json, else full.",
+          ),
       },
     },
-    async ({ activeFilePath, activeFiles, maxSkeletons, maxTokens, includeStats }) => {
+    async ({
+      activeFilePath,
+      activeFiles,
+      maxSkeletons,
+      maxTokens,
+      includeStats,
+      focusLines,
+      ringOneMode,
+    }) => {
       const paths = resolveActiveFiles(activeFilePath, activeFiles);
       // In auto-detect mode each Ring-0 file may live in a different project;
       // ensure the watcher covers every one before assembling.
@@ -498,10 +537,12 @@ export async function startMcpServer(opts: McpServerOptions = {}): Promise<McpSe
       if (!watcher) {
         throw new Error('token-shrink watcher failed to start');
       }
-      const result = assembleMany(paths, watcher.cache.entries, {
+      const result = await assembleContext(paths, watcher.cache.entries, {
+        ...contextOptions(ringOneMode),
         maxSkeletons,
         maxTokens,
         includeStats,
+        focusLines: Array.isArray(focusLines) ? { [paths[0]]: focusLines } : focusLines,
       });
       const ts = result.tokenStats;
       const budgetNote =
@@ -644,9 +685,14 @@ export async function startMcpServer(opts: McpServerOptions = {}): Promise<McpSe
           .optional()
           .describe('Hard token budget for the whole payload'),
         includeStats: z.boolean().optional().describe('Append approximate token-count stats'),
+        ringOneMode: z
+          .enum(['used', 'full'])
+          .optional()
+          .describe("'used': Ring-1 skeletons keep only the exports the changed files import; 'full': whole skeletons"),
       },
     },
     async ({
+      ringOneMode,
       scope,
       base,
       head,
@@ -691,10 +737,19 @@ export async function startMcpServer(opts: McpServerOptions = {}): Promise<McpSe
         }
       }
 
-      const assembled = assembleMany(changed, watcher.cache.entries, {
+      // Changed hunks are the focus: over budget, changed files keep only the
+      // definitions that were edited.
+      const changedLines = await gitChangedLines(repoRoot, {
+        scope: (scope as GitDiffScope) ?? 'worktree',
+        base,
+        head,
+      });
+      const assembled = await assembleContext(changed, watcher.cache.entries, {
+        ...contextOptions(ringOneMode),
         maxSkeletons,
         maxTokens,
         includeStats,
+        focusLines: Object.fromEntries(changed.map((abs) => [abs, changedLines.get(abs) ?? []])),
       });
 
       // Reverse edges: files that import the changed files (file-level callers).
@@ -708,14 +763,25 @@ export async function startMcpServer(opts: McpServerOptions = {}): Promise<McpSe
           importerOf.set(imp, list);
         }
       }
-      const importerList = [...new Set([...importerOf.values()].flat())].filter(
-        (f) => !changedSet.has(f),
-      );
+      // Ring-2 candidates, most relevant first: importers of more changed files,
+      // then shallower paths, then discovery order.
+      const importsChanged = new Map<string, number>();
+      for (const list of importerOf.values()) {
+        for (const f of list) importsChanged.set(f, (importsChanged.get(f) ?? 0) + 1);
+      }
+      const importerList = [...importsChanged.keys()]
+        .filter((f) => !changedSet.has(f))
+        .map((f, idx) => ({ f, idx }))
+        .sort(
+          (a, b) =>
+            importsChanged.get(b.f)! - importsChanged.get(a.f)! ||
+            a.f.split(path.sep).length - b.f.split(path.sep).length ||
+            a.idx - b.idx,
+        )
+        .map((x) => x.f);
       const importerCap = maxImporters ?? 20;
-      const importers = importerList.slice(0, importerCap);
-      const importersTruncated = importerList.length > importers.length;
-      let importerTokens = 0;
-      let importerOriginalTokens = 0;
+      const candidates = importerList.slice(0, importerCap);
+      const cappedOut = importerList.length - candidates.length;
 
       const relLabel = (abs: string) => {
         const rel = path.relative(repoRoot, abs);
@@ -723,89 +789,121 @@ export async function startMcpServer(opts: McpServerOptions = {}): Promise<McpSe
       };
       const fence = (abs: string) => path.extname(abs).replace(/^\./, '') || 'text';
 
-      const parts: string[] = [];
-      parts.push(
-        `# Git Impact Context (${changed.length} changed file${changed.length === 1 ? '' : 's'})`,
-        '',
-      );
-      parts.push(`- changed files: ${changed.map(relLabel).join(', ')}`);
-      if (importers.length > 0) {
-        parts.push(`- importing files (callers): ${importers.map(relLabel).join(', ')}`);
-      }
-      parts.push('', '---', '');
-      parts.push('## Changed files — full code', '');
-      for (const abs of changed) {
-        parts.push(`### \`${relLabel(abs)}\``, '');
-        let source = '';
-        try {
-          source = fs.readFileSync(abs, 'utf8');
-        } catch {
-          /* file vanished between listing and read */
-        }
-        parts.push(`\`\`\`${fence(abs)}`, source.trim() || '(unreadable file)', '```', '');
-      }
-      parts.push(`## Ring 1 — Pruned dependencies (${assembled.included.length})`, '');
-      parts.push('', 'Implementation bodies removed; type signatures, interfaces and exports retained.', '');
-      if (assembled.included.length === 0) {
-        parts.push('_No local dependency skeletons available._', '');
-      }
-      for (const inc of assembled.included) {
-        const entry = watcher.cache.entries.get(inc.filePath);
-        const label = relLabel(inc.filePath);
-        parts.push(`### \`${label}\``, '');
-        if (entry) {
-          parts.push(`\`\`\`${fence(inc.filePath)}`, entry.skeleton.trim(), '```', '');
-        } else {
-          parts.push('_Unindexed file._', '');
-        }
-        parts.push('');
-      }
-      if (assembled.tokenStats.budget !== undefined && assembled.tokenStats.trimmed > 0) {
+      // Renders the whole payload for a chosen set of Ring-2 importers.
+      // `budgetTrimmed` > 0 adds the "excluded by the token budget" note.
+      const render = (importers: string[], budgetTrimmed: number): string => {
+        const parts: string[] = [];
         parts.push(
-          `_Note: token budget of ${assembled.tokenStats.budget} excluded ` +
-            `${assembled.tokenStats.trimmed} lower-priority dependencies._`,
+          `# Git Impact Context (${changed.length} changed file${changed.length === 1 ? '' : 's'})`,
           '',
         );
-      }
-
-      if (importers.length > 0) {
-        parts.push(`## Ring 2 — Files importing the diff (${importers.length})`, '');
-        for (const abs of importers) {
-          const entry = watcher.cache.entries.get(abs);
-          if (!entry) continue;
-          const cost = approximateTokens(entry.skeleton);
-          importerTokens += cost;
-          importerOriginalTokens += entry.originalTokens ?? cost;
+        parts.push(`- changed files: ${changed.map(relLabel).join(', ')}`);
+        if (importers.length > 0) {
+          parts.push(`- importing files (callers): ${importers.map(relLabel).join(', ')}`);
         }
-        parts.push('', 'Pruned skeletons of modules that call into the changed files.', '');
-        for (const abs of importers) {
-          const entry = watcher.cache.entries.get(abs);
+        parts.push('', '---', '');
+        parts.push(
+          assembled.ring0Focused
+            ? '## Changed files — focused on the diff (other bodies pruned to fit the token budget)'
+            : '## Changed files — full code',
+          '',
+        );
+        changed.forEach((abs, i) => {
           parts.push(`### \`${relLabel(abs)}\``, '');
-          if (entry) {
-            parts.push(`\`\`\`${fence(abs)}`, entry.skeleton.trim(), '```', '');
+          const text = assembled.ring0Texts[i] ?? '';
+          parts.push(`\`\`\`${fence(abs)}`, text.trim() || '(unreadable file)', '```', '');
+        });
+        parts.push(`## Ring 1 — Pruned dependencies (${assembled.included.length})`, '');
+        parts.push('', 'Implementation bodies removed; type signatures, interfaces and exports retained.', '');
+        if (assembled.included.length === 0) {
+          parts.push('_No local dependency skeletons available._', '');
+        }
+        for (const inc of assembled.included) {
+          const label = relLabel(inc.filePath);
+          parts.push(`### \`${label}\`${inc.usedOnly ? ' (used exports only)' : ''}`, '');
+          if (inc.skeleton !== undefined) {
+            parts.push(`\`\`\`${fence(inc.filePath)}`, inc.skeleton.trim(), '```', '');
           } else {
             parts.push('_Unindexed file._', '');
           }
           parts.push('');
         }
-        if (importersTruncated) {
+        if (assembled.tokenStats.budget !== undefined && assembled.tokenStats.trimmed > 0) {
           parts.push(
-            `_…and ${importerList.length - importers.length} more importing files (raise maxImporters)._`,
+            `_Note: token budget of ${assembled.tokenStats.budget} excluded ` +
+              `${assembled.tokenStats.trimmed} lower-priority dependencies._`,
             '',
           );
         }
+
+        if (importers.length > 0) {
+          parts.push(`## Ring 2 — Files importing the diff (${importers.length})`, '');
+          parts.push('', 'Pruned skeletons of modules that call into the changed files.', '');
+          for (const abs of importers) {
+            const entry = watcher!.cache.entries.get(abs);
+            parts.push(`### \`${relLabel(abs)}\``, '');
+            if (entry) {
+              parts.push(`\`\`\`${fence(abs)}`, entry.skeleton.trim(), '```', '');
+            } else {
+              parts.push('_Unindexed file._', '');
+            }
+            parts.push('');
+          }
+        }
+        if (budgetTrimmed > 0) {
+          parts.push(
+            `_Note: token budget of ${maxTokens} excluded ${budgetTrimmed} importing ` +
+              `file${budgetTrimmed === 1 ? '' : 's'}._`,
+            '',
+          );
+        }
+        if (cappedOut > 0) {
+          parts.push(
+            `_…and ${cappedOut} more importing files (raise maxImporters)._`,
+            '',
+          );
+        }
+        if (filesTruncated) {
+          parts.push(
+            `_Note: capped to ${fileCap} changed files (${changedResult.files.length} total); ` +
+              'raise maxFiles to include more._',
+            '',
+          );
+        }
+        if (assembled.unresolved.length > 0) {
+          parts.push('## Unresolved imports', '');
+          for (const u of assembled.unresolved) parts.push(`- \`${u}\``);
+          parts.push('');
+        }
+        return parts.join('\n');
+      };
+
+      // Ring 2 gets whatever budget Ring 0 + Ring 1 left. Packing measures the
+      // real rendered payload, always reserving the budget note's line.
+      const importers: string[] = [];
+      for (const abs of candidates) {
+        if (
+          maxTokens === undefined ||
+          approximateTokens(render([...importers, abs], 1)) <= maxTokens
+        ) {
+          importers.push(abs);
+        }
       }
-      if (filesTruncated) {
-        parts.push(
-          `_Note: capped to ${fileCap} changed files (${changedResult.files.length} total); ` +
-            'raise maxFiles to include more._',
-          '',
-        );
+      const budgetTrimmed = candidates.length - importers.length;
+      let payload = render(importers, budgetTrimmed);
+      if (maxTokens !== undefined && approximateTokens(payload) > maxTokens) {
+        payload +=
+          `\n_Note: the changed files alone exceed the token budget of ${maxTokens}; ` +
+          'they are never trimmed (only focused on the diff)._\n';
       }
-      if (assembled.unresolved.length > 0) {
-        parts.push('## Unresolved imports', '');
-        for (const u of assembled.unresolved) parts.push(`- \`${u}\``);
-        parts.push('');
+      let importerTokens = 0;
+      let importerOriginalTokens = 0;
+      for (const abs of importers) {
+        const entry = watcher.cache.entries.get(abs);
+        if (!entry) continue;
+        const cost = approximateTokens(entry.skeleton);
+        importerTokens += cost;
+        importerOriginalTokens += entry.originalTokens ?? cost;
       }
 
       const ts = assembled.tokenStats;
@@ -818,11 +916,12 @@ export async function startMcpServer(opts: McpServerOptions = {}): Promise<McpSe
       reportSavings('git_diff_context', gitSavings);
       const stats =
         `[git-stats] files=${changed.length} ring1=${assembled.included.length} ` +
-        `importers=${importers.length} unresolved=${assembled.unresolved.length} ` +
+        `importers=${importers.length}${budgetTrimmed > 0 ? ` importersTrimmed=${budgetTrimmed}` : ''} ` +
+        `unresolved=${assembled.unresolved.length} ` +
         `tokens=${gitSavings.totalTokens}${savingsNote(gitSavings)}${budgetNote}`;
       return {
         content: [
-          { type: 'text' as const, text: parts.join('\n') },
+          { type: 'text' as const, text: payload },
           { type: 'text' as const, text: stats },
         ],
       };

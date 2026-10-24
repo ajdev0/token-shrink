@@ -30,6 +30,10 @@ export interface AssembleOptions {
   maxTokens?: number;
   /** Whether the active file itself should also be pruned (Ring 0 raw by default). */
   pruneActiveFile?: boolean;
+  /** Ring-0 text to emit instead of the full source (focused slimming), by absolute path. */
+  ring0Overrides?: Map<string, string>;
+  /** Ring-1 text to emit instead of the cached skeleton (used exports), by absolute path. */
+  ring1Overrides?: Map<string, string>;
 }
 
 /** Token accounting for an assembled payload. */
@@ -61,16 +65,28 @@ export interface AssembleResult {
   activeFilePaths: string[];
   /** Ring-0 full text of the active file(s). */
   activeSource: string;
-  /** Ring-1 entries actually included. */
-  included: { filePath: string; language: string | null }[];
+  /** Ring-0 text actually emitted, in `activeFilePaths` order. */
+  ring0Texts: string[];
+  /** True when any Ring-0 file was slimmed to its focus lines. */
+  ring0Focused: boolean;
+  /**
+   * Ring-1 entries actually included. `skeleton` is the emitted text (absent
+   * for unindexed files); `usedOnly` marks a used-exports filtered skeleton.
+   */
+  included: {
+    filePath: string;
+    language: string | null;
+    skeleton?: string;
+    usedOnly?: boolean;
+  }[];
   /** Paths referenced by imports that could not be resolved to a file. */
   unresolved: string[];
   /** Approximate token accounting for this payload. */
   tokenStats: TokenStats;
 }
 
-/** Markdown headers/fences overhead subtracted from a `maxTokens` budget. */
-const MARKDOWN_OVERHEAD_TOKENS = 40;
+/** Rough fixed Markdown overhead (title + section headings), for quick estimates. */
+export const MARKDOWN_OVERHEAD_TOKENS = 40;
 
 /**
  * Build the compressed context for one or more open files.
@@ -92,6 +108,8 @@ export function assembleMany(
     maxSkeletons = 50,
     maxTokens,
     pruneActiveFile = false,
+    ring0Overrides,
+    ring1Overrides,
   } = opts;
 
   const absList = activeFiles.map((p) => path.resolve(p));
@@ -106,9 +124,12 @@ export function assembleMany(
 
   // Ring-0 text that will actually be emitted (pruned only on request).
   const ring0Texts = absList.map((abs, i) => {
+    const override = ring0Overrides?.get(abs);
+    if (override !== undefined) return override;
     const entry = cache.get(abs);
     return pruneActiveFile && entry ? entry.skeleton : sources[i];
   });
+  const focused = absList.some((abs) => ring0Overrides?.has(abs));
 
   const included: AssembleResult['included'] = [];
   const unresolved: string[] = [];
@@ -156,33 +177,67 @@ export function assembleMany(
   const ordered =
     maxTokens === undefined ? included : rankByRelevance(included, cache);
 
-  // Greedy packing: respect maxSkeletons always; additionally stay within the
-  // token budget when one is given.
-  const budget =
-    maxTokens === undefined
-      ? undefined
-      : Math.max(0, maxTokens - MARKDOWN_OVERHEAD_TOKENS);
-  const selected: AssembleResult['included'] = [];
-  let trimmed = 0;
-  let dependencyTokens = 0;
-  let dependencyOriginalTokens = 0;
-  for (const cand of ordered) {
-    if (selected.length >= maxSkeletons) break;
-    const entry = cache.get(cand.filePath);
-    // Unindexed candidates get a small nominal cost until they are indexed.
-    const cost = entry ? approximateTokens(entry.skeleton) : 8;
-    if (budget !== undefined && dependencyTokens + cost > budget) {
-      trimmed++;
-      continue;
-    }
-    selected.push(cand);
-    dependencyTokens += cost;
-    dependencyOriginalTokens += entry?.originalTokens ?? cost;
-  }
   const activeTokens = ring0Texts.reduce(
     (acc, t) => acc + approximateTokens(t),
     0,
   );
+
+  // Greedy packing: respect maxSkeletons always; additionally keep the whole
+  // rendered payload (Ring 0, Ring 1, headings, fences and notes) within the
+  // token budget. Fixed parts are measured from their real text, with
+  // worst-case numbers standing in for the counts filled in after packing.
+  const view = {
+    absList,
+    ring0Texts,
+    focused,
+    unresolved,
+    includeStats,
+    maxTokens,
+  };
+  const fixedTokens = approximateTokens(
+    [
+      ...renderHead(view, maxSkeletons),
+      ...renderTail(view, {
+        trimmed: 2,
+        activeTokens: 1,
+        dependencyTokens: 1,
+        originalTokens: 1,
+        savedTokens: 1,
+        reductionPct: 0.5,
+      }),
+    ].join('\n'),
+  );
+  const budget =
+    maxTokens === undefined ? undefined : Math.max(0, maxTokens - fixedTokens);
+  // Ring 0 is never trimmed; say so when it alone cannot fit the budget.
+  const ring0OverBudget = maxTokens !== undefined && fixedTokens > maxTokens;
+  const selected: AssembleResult['included'] = [];
+  let trimmed = 0;
+  let dependencyTokens = 0;
+  let dependencyOriginalTokens = 0;
+  let packed = 0;
+  for (const cand of ordered) {
+    if (selected.length >= maxSkeletons) break;
+    const entry = cache.get(cand.filePath);
+    const override = ring1Overrides?.get(cand.filePath);
+    const skeleton = entry ? (override ?? entry.skeleton) : undefined;
+    const item = {
+      ...cand,
+      ...(skeleton !== undefined ? { skeleton } : {}),
+      ...(entry && override !== undefined ? { usedOnly: true } : {}),
+    };
+    // Unindexed candidates get a small nominal cost until they are indexed.
+    const cost = skeleton !== undefined ? approximateTokens(skeleton) : 8;
+    const blockCost = approximateTokens(renderRing1Block(item).join('\n'));
+    if (budget !== undefined && packed + blockCost > budget) {
+      trimmed++;
+      continue;
+    }
+    packed += blockCost;
+    selected.push(item);
+    dependencyTokens += cost;
+    dependencyOriginalTokens += entry?.originalTokens ?? cost;
+  }
   // Ring 0 baseline is the full source, even when it was pruned on request.
   const activeOriginalTokens = sources.reduce(
     (acc, t) => acc + approximateTokens(t),
@@ -195,80 +250,25 @@ export function assembleMany(
   );
   const savings = savingsOf({ originalTokens, totalTokens });
 
-  const lines: string[] = [];
-  lines.push('# Compressed Code Context', '');
-
-  if (absList.length === 1) {
-    lines.push(`Active file: \`${rel(absList[0])}\``, '');
-  } else {
-    lines.push('Active files:', '');
-    for (const p of absList) lines.push(`- \`${rel(p)}\``);
-    lines.push('');
-  }
-
-  // Ring 0.
-  lines.push(
-    absList.length === 1
-      ? '## Ring 0 — Active file (full text)'
-      : '## Ring 0 — Active files (full text)',
-    '',
-  );
-  for (let i = 0; i < absList.length; i++) {
-    if (absList.length > 1) lines.push(`### \`${rel(absList[i])}\``, '');
-    const body = ring0Texts[i].trim() || '(empty or unreadable file)';
-    lines.push(`\`\`\`${ext(absList[i])}`, body, '```', '');
-  }
-
-  // Ring 1.
-  lines.push(
-    `## Ring 1 — Pruned dependencies (${selected.length})`,
-    '',
-    'Implementation bodies removed; type signatures, interfaces and exports retained.',
-    '',
-  );
-  if (selected.length === 0) {
-    lines.push('_No local dependency skeletons available._', '');
-  }
-  for (const inc of selected) {
-    const entry = cache.get(inc.filePath);
-    const label = rel(inc.filePath);
-    lines.push(`### \`${label}\``, '');
-    if (entry) {
-      lines.push(`\`\`\`${ext(inc.filePath)}`, entry.skeleton.trim(), '```', '');
-    } else {
-      lines.push('_Unindexed file._', '');
-    }
-  }
-  if (maxTokens !== undefined && trimmed > 0) {
-    lines.push(
-      `_Note: token budget of ${maxTokens} excluded ${trimmed} lower-priority dependenc${trimmed === 1 ? 'y' : 'ies'}._`,
-      '',
-    );
-  }
-
-  if (unresolved.length > 0) {
-    lines.push('## Unresolved imports', '');
-    for (const u of unresolved) lines.push(`- \`${u}\``);
-    lines.push('');
-  }
-
-  if (includeStats) {
-    const budgetNote =
-      maxTokens !== undefined ? ` · budget ${maxTokens} (${trimmed} deps trimmed)` : '';
-    lines.push(
-      '---',
-      '',
-      `_Token estimate — active: ${activeTokens} · pruned deps: ${dependencyTokens} · ` +
-        `original: ${originalTokens} · saved: ${savings.savedTokens} (${savings.reductionPct}%)${budgetNote}._`,
-      '',
-    );
-  }
+  const lines = [
+    ...renderHead(view, selected.length),
+    ...selected.flatMap(renderRing1Block),
+    ...renderTail({ ...view, ring0OverBudget }, {
+      trimmed,
+      activeTokens,
+      dependencyTokens,
+      originalTokens,
+      ...savings,
+    }),
+  ];
 
   return {
     markdown: lines.join('\n'),
     activeFilePath: absList[0] ?? '',
     activeFilePaths: absList,
     activeSource: sources.join('\n'),
+    ring0Texts,
+    ring0Focused: focused,
     included: selected,
     unresolved,
     tokenStats: {
@@ -293,6 +293,119 @@ export function assemble(
   opts: AssembleOptions = {},
 ): AssembleResult {
   return assembleMany([activeFilePath], cache, opts);
+}
+
+/** What the Markdown renderers need from an assembly. */
+interface RenderView {
+  absList: string[];
+  ring0Texts: string[];
+  focused: boolean;
+  unresolved: string[];
+  includeStats: boolean;
+  maxTokens?: number;
+  /** Ring 0 alone exceeds `maxTokens` (it is kept in full regardless). */
+  ring0OverBudget?: boolean;
+}
+
+/** Title, Ring 0 and the Ring-1 intro. */
+function renderHead(v: RenderView, ring1Count: number): string[] {
+  const lines: string[] = ['# Compressed Code Context', ''];
+  if (v.absList.length === 1) {
+    lines.push(`Active file: \`${rel(v.absList[0])}\``, '');
+  } else {
+    lines.push('Active files:', '');
+    for (const p of v.absList) lines.push(`- \`${rel(p)}\``);
+    lines.push('');
+  }
+  lines.push(
+    v.absList.length === 1
+      ? '## Ring 0 — Active file (full text)'
+      : '## Ring 0 — Active files (full text)',
+    '',
+  );
+  if (v.focused) {
+    lines.push(
+      '_Focused to fit the token budget: bodies outside the focus lines are pruned._',
+      '',
+    );
+  }
+  for (let i = 0; i < v.absList.length; i++) {
+    if (v.absList.length > 1) lines.push(`### \`${rel(v.absList[i])}\``, '');
+    const body = v.ring0Texts[i].trim() || '(empty or unreadable file)';
+    lines.push(`\`\`\`${ext(v.absList[i])}`, body, '```', '');
+  }
+  lines.push(
+    `## Ring 1 — Pruned dependencies (${ring1Count})`,
+    '',
+    'Implementation bodies removed; type signatures, interfaces and exports retained.',
+    '',
+  );
+  if (ring1Count === 0) lines.push('_No local dependency skeletons available._', '');
+  return lines;
+}
+
+/** One Ring-1 dependency: heading plus fenced skeleton. */
+function renderRing1Block(inc: AssembleResult['included'][number]): string[] {
+  const lines = [`### \`${rel(inc.filePath)}\`${inc.usedOnly ? ' (used exports only)' : ''}`, ''];
+  if (inc.skeleton !== undefined) {
+    lines.push(`\`\`\`${ext(inc.filePath)}`, inc.skeleton.trim(), '```', '');
+  } else {
+    lines.push('_Unindexed file._', '');
+  }
+  return lines;
+}
+
+/** Budget note, unresolved imports and the optional stats line. */
+function renderTail(
+  v: RenderView,
+  n: {
+    trimmed: number;
+    activeTokens: number;
+    dependencyTokens: number;
+    originalTokens: number;
+    savedTokens: number;
+    reductionPct: number;
+  },
+): string[] {
+  const lines: string[] = [];
+  if (v.ring0OverBudget) {
+    lines.push(
+      `_Note: the active file${v.absList.length === 1 ? '' : 's'} alone exceed the token budget of ` +
+        `${v.maxTokens}; Ring 0 is never trimmed (pass focusLines to slim it)._`,
+      '',
+    );
+  }
+  if (v.maxTokens !== undefined && n.trimmed > 0) {
+    lines.push(
+      `_Note: token budget of ${v.maxTokens} excluded ${n.trimmed} lower-priority dependenc${n.trimmed === 1 ? 'y' : 'ies'}._`,
+      '',
+    );
+  }
+  if (v.unresolved.length > 0) {
+    lines.push('## Unresolved imports', '');
+    for (const u of v.unresolved) lines.push(`- \`${u}\``);
+    lines.push('');
+  }
+  if (v.includeStats) {
+    const budgetNote =
+      v.maxTokens !== undefined ? ` · budget ${v.maxTokens} (${n.trimmed} deps trimmed)` : '';
+    lines.push(
+      '---',
+      '',
+      `_Token estimate — active: ${n.activeTokens} · pruned deps: ${n.dependencyTokens} · ` +
+        `original: ${n.originalTokens} · saved: ${n.savedTokens} (${n.reductionPct}%)${budgetNote}._`,
+      '',
+    );
+  }
+  return lines;
+}
+
+/**
+ * Tokens a file's Markdown wrapper costs: its `### \`path\`` heading plus the
+ * code fence around its text.
+ */
+export function fileBlockOverhead(filePath: string): number {
+  return approximateTokens(`### \`${rel(filePath)}\`\n\`\`\`${ext(filePath)}\n\`\`\``);
 }
 
 /** Rank Ring-1 candidates by a cheap relevance proxy: fan-in desc, then depth asc. */
@@ -336,7 +449,7 @@ export function extractSpecifiers(source: string): string[] {
 }
 
 /** Resolve a fallback specifier to an existing file, mirroring sync.resolveImport. */
-function resolveLocal(importer: string, specifier: string): string | null {
+export function resolveLocal(importer: string, specifier: string): string | null {
   if (!/^[.~@]/.test(specifier)) return null;
   if (specifier.startsWith('@/')) specifier = specifier.slice(2);
   else if (specifier.startsWith('~')) specifier = specifier.slice(1);

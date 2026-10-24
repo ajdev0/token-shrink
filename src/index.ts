@@ -28,7 +28,7 @@ export {
   CONFIG_FILE_NAME,
   configPathFor,
 } from './config.js';
-export type { TokenShrinkConfig } from './config.js';
+export type { TokenShrinkConfig, RingOneMode } from './config.js';
 
 export {
   createWatcher,
@@ -41,6 +41,9 @@ export type { CacheEntry, GraphCache, SyncOptions } from './watcher/sync.js';
 
 export { assemble, assembleMany, extractSpecifiers, approximateTokens } from './server/assembler.js';
 export type { AssembleOptions, AssembleResult, TokenStats } from './server/assembler.js';
+export { assembleContext, importedNames } from './server/context.js';
+export type { ContextOptions, ImportedNames } from './server/context.js';
+export { gitChangedFiles, gitChangedLines } from './git.js';
 
 export { startServer } from './cli.js';
 export type { CliOptions } from './cli.js';

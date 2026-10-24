@@ -91,6 +91,8 @@ wasm/
 ```
 
 - First run requires network access; afterwards everything is offline and fast.
+- Each grammar is pinned to an exact release that the bundled `web-tree-sitter` 0.27 runtime loads (tree-sitter ABI 13–15). Cache files are keyed by the pinned URL, so a new pin is fetched automatically, and a cached grammar the runtime can't load is re-downloaded.
+- Dart has no upstream wasm release; it comes from the [`@repomix/tree-sitter-wasms`](https://www.npmjs.com/package/@repomix/tree-sitter-wasms) prebuilt package.
 - Files are written atomically (`*.tmp` → rename) with an in-flight lock, so concurrent first-run parses never corrupt the cache.
 
 ---
@@ -202,16 +204,20 @@ Opt out also via `--create-rule=false` or `TOKEN_SHRINK_CREATE_RULE=0`.
 | `activeFilePath` | `string`   | no*      | Single file the agent is working on                |
 | `activeFiles`    | `string[]` | no*      | Multiple Ring-0 files (combined Ring 1)            |
 | `maxSkeletons`   | `number`   | no       | Cap on Ring-1 files (default `50`, max `200`)      |
-| `maxTokens`      | `number`   | no       | Hard token budget; Ring 1 is relevance-packed to fit |
+| `maxTokens`      | `number`   | no       | Budget for the whole rendered payload (headings and fences included); Ring 1 is relevance-packed into what Ring 0 leaves. Ring 0 is never cut, so if it alone is too big the payload says so |
 | `includeStats`   | `boolean`  | no       | Append approximate token counts                    |
+| `focusLines`     | `number[]` \| `{ [path]: number[] }` | no | 1-based lines being edited; when Ring 0 alone exceeds `maxTokens`, only the definitions around them keep their bodies |
+| `ringOneMode`    | `"used"` \| `"full"` | no | `used`: Ring-1 skeletons keep only the exports Ring 0 imports (default from config, else `full`) |
 
 \* Provide exactly one of `activeFilePath` / `activeFiles`. Ring 0 stays full; Ring 1 is the union of each file's local imports, minus files already in Ring 0.
 
 `expand_symbol({ filePath, symbolName, maxMatches? })` — when a skeleton isn't enough, returns the **full, un-pruned definition** (function/class/method/… bodies included) for the named symbol in that file. Overloads and same-named members are all returned.
 
-`git_diff_context({ scope?, base?, head?, includeUntracked?, maxFiles?, maxImporters?, maxSkeletons?, maxTokens? })` — impact analysis for changed code:
+`git_diff_context({ scope?, base?, head?, includeUntracked?, maxFiles?, maxImporters?, maxSkeletons?, maxTokens?, ringOneMode? })` — impact analysis for changed code:
+- when the changed files alone exceed `maxTokens`, they are focused on the diff: the definitions containing changed lines stay in full, other bodies are pruned.
 - `scope`: `worktree` (default) · `staged` · `branch` (`base...head`, defaults `HEAD~1...HEAD`)
 - changed files are emitted in full as Ring 0; their imports **and** the files that import them (file-level callers) are attached as pruned skeletons. Great for PR reviews and multi-file regressions where there is no single active file.
+- with `maxTokens`, the payload is packed in order: changed files → their imports (Ring 1) → callers (Ring 2, those importing the most changed files first). Callers that don't fit are listed in a note.
 
 `search_symbol_signatures({ query, maxResults?, kind? })` — repo-wide lookup of definitions backed by an in-memory index of the tree-sitter symbol pass. Returns compact `` `file:line — signature` `` lines (not raw file dumps), ranked exact → prefix → substring.
 
@@ -221,13 +227,15 @@ Opt out also via `--create-rule=false` or `TOKEN_SHRINK_CREATE_RULE=0`.
 {
   "ignorePatterns": ["**/dist/**", "**/generated/**"],
   "keepUnpruned": ["src/types/global.d.ts", "lib/models/*.dart"],
-  "preserveAnnotations": ["@keepContext", "@api"]
+  "preserveAnnotations": ["@keepContext", "@api"],
+  "ringOneMode": "used"
 }
 ```
 
 - `ignorePatterns` — globs that are never indexed or watched.
 - `keepUnpruned` — files that are indexed but never pruned (always full text).
 - `preserveAnnotations` — definitions (and everything nested in them) preceded by `@marker` are kept fully un-pruned.
+- `ringOneMode` — `"used"` trims each TS/JS dependency skeleton to the exports the active files import (`import { a } from './x'`), plus the declarations their signatures reference and any `export … from` lines. Namespace (`* as`), side-effect, `require` and dynamic imports, CommonJS files and non-JS languages keep the full skeleton. Default `"full"`.
 
 Invalid JSON logs a warning and falls back to defaults; editing the file while the server runs re-indexes automatically.
 
@@ -241,7 +249,7 @@ token-shrink --root /path/to/project --port 3000 --max-tokens 4000
 | Route         | Method | Body                                                   | Returns                          |
 | ------------- | ------ | ------------------------------------------------------ | -------------------------------- |
 | `/health`     | `GET`  | —                                                      | status, root, indexed file count |
-| `/v1/context` | `POST` | `{ activeFilePath? \| activeFiles?, maxSkeletons?, maxTokens?, includeStats? }` | assembled Markdown + deps + stats |
+| `/v1/context` | `POST` | `{ activeFilePath? \| activeFiles?, maxSkeletons?, maxTokens?, includeStats?, focusLines?, ringOneMode? }` | assembled Markdown + deps + stats |
 
 
 ```bash
@@ -313,7 +321,7 @@ S-expression queries match implementation blocks; interfaces, signatures, and ex
 | Go              | `.go`                                   | `tree-sitter-go.wasm`         | `block`              |
 | Rust            | `.rs`                                   | `tree-sitter-rust.wasm`       | `block`              |
 | Java            | `.java`                                 | `tree-sitter-java.wasm`       | `block`              |
-| Kotlin          | `.kt` `.kts`                            | `tree-sitter-kotlin.wasm`     | `block`              |
+| Kotlin          | `.kt` `.kts`                            | `tree-sitter-kotlin.wasm`     | `function_body`      |
 | C               | `.c` `.h`                               | `tree-sitter-c.wasm`          | `compound_statement` |
 | C++             | `.cc` `.cpp` `.cxx` `.hpp` `.hh` `.hxx` | `tree-sitter-cpp.wasm`        | `compound_statement` |
 | PHP             | `.php`                                  | `tree-sitter-php.wasm`        | `compound_statement` |

@@ -8,6 +8,7 @@
  * which returns a `Uint8Array` for the pruner to load directly.
  */
 
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { LanguageSpec } from './registry.js';
@@ -45,8 +46,14 @@ function cacheDir(): string {
   return wasmDir;
 }
 
+/**
+ * On-disk cache file for a grammar. The name carries a hash of the pinned
+ * download URL, so changing a pin fetches the new release instead of reusing
+ * an older cached build.
+ */
 export function cachePath(spec: LanguageSpec): string {
-  return path.join(cacheDir(), spec.wasm);
+  const tag = createHash('sha1').update(spec.url).digest('hex').slice(0, 8);
+  return path.join(cacheDir(), spec.wasm.replace(/\.wasm$/, `.${tag}.wasm`));
 }
 
 /** True if the head bytes are the wasm magic `\0asm`. */
@@ -60,11 +67,11 @@ function looksLikeWasm(bytes: Uint8Array): boolean {
   );
 }
 
-/** In-flight downloads keyed by wasm filename, so concurrent callers share one. */
+/** In-flight downloads keyed by cache path, so concurrent callers share one. */
 const inflight = new Map<string, Promise<Uint8Array>>();
 
 function download(spec: LanguageSpec): Promise<Uint8Array> {
-  const pending = inflight.get(spec.wasm);
+  const pending = inflight.get(cachePath(spec));
   if (pending) return pending;
   const job = (async () => {
     const res = await fetch(spec.url, { redirect: 'follow' });
@@ -85,13 +92,13 @@ function download(spec: LanguageSpec): Promise<Uint8Array> {
     const tmp = `${target}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, bytes);
     fs.renameSync(tmp, target);
-    inflight.delete(spec.wasm);
+    inflight.delete(cachePath(spec));
     return bytes;
   })().catch((err) => {
-    inflight.delete(spec.wasm);
+    inflight.delete(cachePath(spec));
     throw err;
   });
-  inflight.set(spec.wasm, job);
+  inflight.set(cachePath(spec), job);
   return job;
 }
 
@@ -119,7 +126,7 @@ export async function warmGrammars(specs: LanguageSpec[] = []): Promise<number> 
   const list =
     specs.length > 0 ? specs : (Object.values(registryModule.registry) as LanguageSpec[]);
   const unique = new Map<string, LanguageSpec>();
-  for (const spec of list) unique.set(spec.wasm, spec);
+  for (const spec of list) unique.set(cachePath(spec), spec);
   const results = await Promise.allSettled(
     [...unique.values()].map((spec) => getGrammar(spec)),
   );

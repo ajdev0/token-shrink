@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import Parser from 'web-tree-sitter';
+import { Parser, type Node } from 'web-tree-sitter';
 
 import { prune, loadLanguage } from '../src/parser/pruner.js';
 import { languageForFile } from '../src/parser/registry.js';
@@ -16,9 +16,9 @@ const BASELINE_PCT = Number(process.env.REDUCTION_BASELINE ?? 65);
 async function errorCount(file: string, code: string): Promise<number> {
   const parser = new Parser();
   parser.setLanguage(await loadLanguage(languageForFile(file)!));
-  const tree = parser.parse(code);
+  const tree = parser.parse(code)!;
   let n = 0;
-  const walk = (node: Parser.SyntaxNode) => {
+  const walk = (node: Node) => {
     if (node.type === 'ERROR' || node.isMissing) n++;
     for (const child of node.children) walk(child);
   };

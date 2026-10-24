@@ -10,6 +10,9 @@ export default defineConfig({
   publicDir: 'wasm',
   sourcemap: true,
   target: 'node18',
+  // Provide `__filename`/`__dirname` in the ESM build (and `import.meta.url` in
+  // CJS): the parser and grammar cache resolve wasm files relative to them.
+  shims: true,
   // Prepend a shebang to every generated JS file so the `bin` targets
   // (dist/cli.cjs, dist/mcp.cjs) are valid executable entry points. A hashbang
   // is a legal leading comment, so this is harmless on library/chunk output.

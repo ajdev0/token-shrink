@@ -216,3 +216,13 @@ describe('extra shrinking passes (TypeScript)', () => {
     expect(code).toBe('export const a = 1;\n\nexport const b = 2;\n');
   });
 });
+
+describe('incompatible grammar', () => {
+  it('falls back to the unpruned source instead of throwing', async () => {
+    const source = 'export function f() {\n  return 1;\n}\n';
+    // The downloaded JS grammar may be newer than the runtime supports; either
+    // way analyze() must return usable text.
+    const res = await prune('/tmp/compat.js', source);
+    expect(res.code.startsWith('export function f()')).toBe(true);
+  });
+});

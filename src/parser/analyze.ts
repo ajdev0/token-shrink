@@ -8,13 +8,14 @@
  * `pruner.ts` for backwards compatibility.
  */
 
-import Parser from 'web-tree-sitter';
+import { Language, Parser, Query } from 'web-tree-sitter';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 
 import { languageForFile, type LanguageSpec } from './registry.js';
 import { getGrammar } from './wasm.js';
 import { collectSymbols, type SymbolInfo } from './symbols.js';
+import { unusedTopLevelRanges } from './used-exports.js';
 
 /** A byte-range that will be replaced by `token`. */
 export interface PruneRange {
@@ -28,7 +29,7 @@ export interface PruneRange {
  * name. Grammar bytes only change when the on-disk binary changes, so we can
  * decode once per process and reuse it across all parses for that language.
  */
-const languageCache = new Map<string, Parser.Language>();
+const languageCache = new Map<string, Language>();
 
 let initPromise: Promise<void> | null = null;
 /** `Parser.init()` only needs to run once; make concurrent calls share it. */
@@ -36,14 +37,15 @@ export function ensureParserInit(): Promise<void> {
   if (!initPromise) {
     initPromise = Parser.init({
       locateFile: (file: string) => {
-        // Point the wasm runtime at the bundled tree-sitter.wasm so it works
-        // from tsup's dist build as well as from node_modules. `__filename` is
-        // shimmed by tsup for ESM and native in CJS, avoiding the empty
-        // `import.meta.url` that crashes the CJS CLI bundle.
+        // Point the wasm runtime at the bundled web-tree-sitter.wasm so it
+        // works from tsup's dist build as well as from node_modules.
+        // `__filename` is shimmed by tsup for ESM and native in CJS, avoiding
+        // the empty `import.meta.url` that crashes the CJS CLI bundle. The
+        // package exports the runtime wasm (but not package.json) by name.
         const require = createRequire(__filename);
         try {
-          const pkgRoot = path.dirname(require.resolve('web-tree-sitter/package.json'));
-          return path.join(pkgRoot, file);
+          const runtime = require.resolve('web-tree-sitter/web-tree-sitter.wasm');
+          return path.join(path.dirname(runtime), file);
         } catch {
           return file;
         }
@@ -57,7 +59,7 @@ export function ensureParserInit(): Promise<void> {
 export function loadLanguage(
   spec: LanguageSpec,
   force = false,
-): Promise<Parser.Language> {
+): Promise<Language> {
   if (!force) {
     const cached = languageCache.get(spec.wasm);
     if (cached) return Promise.resolve(cached);
@@ -66,11 +68,34 @@ export function loadLanguage(
   if (force) languageCache.delete(spec.wasm);
   return (async () => {
     await ensureParserInit();
-    const grammar = await getGrammar(spec, force);
-    const language = await Parser.Language.load(grammar);
+    let language = await Language.load(await getGrammar(spec, force));
+    // A cached grammar from an older, unpinned download may target a newer
+    // ABI than this runtime: replace it with the pinned release once.
+    if (!force && !isCompatible(language)) {
+      language = await Language.load(await getGrammar(spec, true));
+    }
+    if (!isCompatible(language)) {
+      throw new Error(
+        `Grammar "${spec.wasm}" uses tree-sitter ABI ${language.abiVersion}, ` +
+          'which the bundled web-tree-sitter runtime cannot load.',
+      );
+    }
     languageCache.set(spec.wasm, language);
     return language;
   })();
+}
+
+/** Whether this runtime can use `language` (setLanguage throws otherwise). */
+function isCompatible(language: Language): boolean {
+  const probe = new Parser();
+  try {
+    probe.setLanguage(language);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    probe.delete();
+  }
 }
 
 /**
@@ -128,6 +153,18 @@ export interface AnalyzeOptions {
    * preceding source window contains `@<marker>` is kept fully unpruned.
    */
   preserveAnnotations?: string[];
+  /**
+   * 1-based lines the reader is focused on (cursor, changed hunks). The
+   * innermost definition containing each line, and every block containing
+   * it, stay unpruned; everything else is pruned as usual.
+   */
+  focusLines?: number[];
+  /**
+   * Names an importer actually uses (`default` for a default import). When
+   * set, top-level TS/JS statements those names don't reach are dropped.
+   * Ignored when the file has no ES exports or declares none of the names.
+   */
+  keepOnly?: string[];
 }
 
 export interface AnalyzeResult {
@@ -156,7 +193,7 @@ export async function analyze(
     return { code: source, language: null, removed: 0, symbols: [] };
   }
 
-  let language: Parser.Language;
+  let language: Language;
   try {
     language = await loadLanguage(spec, opts.forceDownload);
   } catch {
@@ -164,8 +201,18 @@ export async function analyze(
   }
 
   const parser = new Parser();
-  parser.setLanguage(language);
+  try {
+    parser.setLanguage(language);
+  } catch {
+    // Grammar ABI newer than the bundled runtime: keep the file usable, unpruned.
+    parser.delete();
+    return { code: source, language: null, removed: 0, symbols: [] };
+  }
   const tree = parser.parse(source);
+  if (!tree) {
+    parser.delete();
+    return { code: source, language: null, removed: 0, symbols: [] };
+  }
   try {
     const symbols = collectSymbols(tree.rootNode, source);
     if (opts.skipPrune) {
@@ -180,16 +227,24 @@ export async function analyze(
         ? annotatedKeepRanges(symbols, source, opts.preserveAnnotations)
         : []),
     ];
+    const focusOffsets = (opts.focusLines ?? [])
+      .map((line) => lineOffset(source, line))
+      .filter((o): o is number => o !== null);
+    for (const offset of focusOffsets) {
+      const inner = innermostSymbol(symbols, offset);
+      if (inner) keepRanges.push({ start: inner.start, end: inner.end });
+    }
     const isProtected = (start: number, end: number) =>
-      keepRanges.some((k) => k.start <= start && end <= k.end);
+      keepRanges.some((k) => k.start <= start && end <= k.end) ||
+      focusOffsets.some((o) => start <= o && o < end);
     const annotationRe = annotationRegExp(opts.preserveAnnotations ?? []);
 
     const ranges: PruneRange[] = [];
     for (const rule of spec.rules) {
       const { replacement } = rule;
-      let query: Parser.Query;
+      let query: Query;
       try {
-        query = language.query(rule.query);
+        query = new Query(language, rule.query);
       } catch {
         continue; // node type missing from this grammar version — skip the rule
       }
@@ -220,6 +275,9 @@ export async function analyze(
         });
       }
       query.delete();
+    }
+    if (opts.keepOnly) {
+      ranges.push(...unusedTopLevelRanges(tree.rootNode, source, opts.keepOnly, ranges));
     }
 
     const { code, removed } = spliceRanges(source, ranges);
@@ -274,6 +332,31 @@ function annotatedKeepRanges(
       return re.test(relevant);
     })
     .map((s) => ({ start: s.start, end: s.end }));
+}
+
+/** Byte offset of the first non-blank character on a 1-based line, or null past EOF. */
+function lineOffset(source: string, line: number): number | null {
+  if (!Number.isInteger(line) || line < 1) return null;
+  let offset = 0;
+  for (let l = 1; l < line; l++) {
+    const nl = source.indexOf('\n', offset);
+    if (nl === -1) return null;
+    offset = nl + 1;
+  }
+  const lineEnd = source.indexOf('\n', offset);
+  const text = source.slice(offset, lineEnd === -1 ? source.length : lineEnd);
+  return offset + (text.length - text.trimStart().length);
+}
+
+/** Smallest symbol whose range contains `offset`. */
+function innermostSymbol(symbols: SymbolInfo[], offset: number): SymbolInfo | null {
+  let best: SymbolInfo | null = null;
+  for (const s of symbols) {
+    if (s.start <= offset && offset < s.end && (!best || s.end - s.start < best.end - best.start)) {
+      best = s;
+    }
+  }
+  return best;
 }
 
 /** `@marker` matcher for the configured annotations, or null when none. */

@@ -1,406 +1,405 @@
 # token-shrink
 
-A **local-first, framework-aware token reduction engine** — a polyglot AST semantic proxy and MCP server. It prunes implementation bodies out of **dependency files** while preserving every type signature, interface, and module export, so LLM agents see the full shape of the code at a fraction of the tokens.
+**Cut the tokens your AI coding agent reads, without hiding how your code fits together.**
 
-> **The 80–90% reduction target**: full type information, no implementation noise. Ring 0 (your active file) stays complete; Ring 1 (its direct imports) is delivered as pruned skeletons.
+When an agent such as Claude Code, Cursor or Cline works on a file, it also needs the files that file imports. token-shrink sends those imported files as **skeletons**: every type, interface and function signature stays, and the function bodies are left out. The agent still knows how to call everything correctly, and you pay for far fewer tokens.
+
+```text
+⚡ token-shrink: 29,597 → 12,274 tokens (−17,323 · 58.5% saved)
+```
+
+On its own source code, token-shrink removes about **70%** of the tokens. It works with 14 languages, runs entirely on your machine, and needs no API key.
+
+---
+
+## Contents
+
+- [Quick start (Claude Code)](#quick-start-claude-code)
+- [Cursor, Cline and other agents](#cursor-cline-and-other-agents)
+- [See how much you save](#see-how-much-you-save)
+- [Troubleshooting](#troubleshooting)
+- [What your agent gets](#what-your-agent-gets)
+- [Project settings](#project-settings)
+- [Server options](#server-options)
+- [Supported languages](#supported-languages)
+- [Updating](#updating)
+- [Advanced: HTTP server, library, tool reference](#advanced)
+- [How it works](#how-it-works)
+- [Development](#development)
+
+---
+
+## Quick start (Claude Code)
+
+You need **Node.js 18 or newer** (`node --version` to check). There's nothing else to install, because `npx` downloads token-shrink when it first runs.
+
+### 1. Add the server
+
+**Recommended: once, for all your projects.** Run this from any folder:
+
+```bash
+claude mcp add token-shrink --scope user -- npx -y -p @ajdev0/token-shrink token-shrink-mcp
+```
+
+Leave out `--root` here. token-shrink finds the project you're working in by itself, from the nearest `.git` folder or `package.json`.
+
+**Or: for one project only.** Run this from inside that project's folder:
+
+```bash
+cd /path/to/your-project
+claude mcp add token-shrink -- npx -y -p @ajdev0/token-shrink token-shrink-mcp --root .
+```
+
+> **Run that command in the project folder, not your home folder.** Without `--scope user`, Claude Code saves the server only for the folder you ran the command in. If you run it in your home folder, it won't appear when you open Claude in your project. See [Troubleshooting](#troubleshooting).
+
+### 2. Restart Claude Code and check
+
+Open Claude Code in your project and type `/mcp`. You should see **token-shrink** listed as connected. From a terminal, `claude mcp list` shows the same thing:
+
+```text
+token-shrink: npx -y -p @ajdev0/token-shrink token-shrink-mcp - ✔ Connected
+```
+
+### 3. Just work
+
+You don't need to change how you prompt. The first time the server starts in a project, it writes a small rule file (`.claude/rules/token-shrink.md`) that tells Claude to use token-shrink before working on a file. The first run also downloads the parsers for your languages, so it needs internet access once.
+
+---
+
+## Cursor, Cline and other agents
+
+Any agent that supports MCP servers can use token-shrink. Use this server definition:
+
+```json
+{
+  "mcpServers": {
+    "token-shrink": {
+      "command": "npx",
+      "args": ["-y", "-p", "@ajdev0/token-shrink", "token-shrink-mcp", "--root", "/absolute/path/to/your-project"]
+    }
+  }
+}
+```
+
+| Agent | Where the definition goes | Rule file token-shrink writes |
+| ----- | ------------------------- | ----------------------------- |
+| Cursor | `.cursor/mcp.json` in your project | `.cursor/rules/token-shrink.mdc` |
+| Cline | MCP Servers → Configure MCP Servers | `.clinerules/token-shrink.md` |
+| Other MCP clients | wherever that client keeps MCP servers | none; ask the agent to call `get_compressed_code_context` |
+
+By default, rule files are written for Claude Code, Cursor and Cline. Pick only the ones you use with `--rule-target` (see [Server options](#server-options)).
+
+---
+
+## See how much you save
+
+Every request is measured against what the same files would cost without token-shrink. The totals are saved in your project, in `.token-shrink/stats.json`.
+
+### In your terminal
+
+Run this **inside your project folder**:
+
+```bash
+npx -y -p @ajdev0/token-shrink token-shrink stats
+```
+
+Example output:
+
+```text
+⚡ last call (get_compressed_code_context): 29,597 → 12,274 tokens (−17,323 · 58.5% saved)
+⚡ session · 6 calls: 84,920 → 32,610 tokens (−52,310 · 61.6% saved)
+⚡ all time · 41 calls: 512,400 → 188,950 tokens (−323,450 · 63.1% saved)
+```
+
+To check a different folder, add `--root /path/to/project`. If you see `No token-shrink stats yet`, the agent hasn't asked for context in that project yet.
+
+### In Claude Code's status line (yellow, always visible)
+
+**1. Download the status line script:**
+
+```bash
+curl -fsSL -o ~/.claude/token-shrink-statusline.mjs \
+  https://raw.githubusercontent.com/ajdev0/token-shrink/main/hooks/claude/statusline.mjs
+```
+
+**2. Add this to `~/.claude/settings.json`** (create the file if it doesn't exist):
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "node ~/.claude/token-shrink-statusline.mjs"
+  }
+}
+```
+
+Restart Claude Code. Below the prompt you'll see something like this, in yellow:
+
+```text
+⚡ token-shrink −17,323 tokens (58.5%) · session −52,310 (61.6%)
+```
+
+The line stays empty until token-shrink has handled a request in the current project. If you already have a `statusLine` setting, this replaces it.
+
+### Good to know
+
+- Add `.token-shrink/` to your project's `.gitignore`. The stats are personal and change constantly.
+- To turn stats off, add `--no-stats` to the server command, or set `TOKEN_SHRINK_STATS=0`.
+- Colors follow your terminal. `NO_COLOR=1` turns them off, and `FORCE_COLOR=1` forces them on.
+
+---
+
+## Troubleshooting
+
+### "MCP server token-shrink already exists in local config", but it isn't in `/mcp`
+
+You added it earlier from a different folder, often your home folder. A server added without `--scope user` only shows up in the folder it was added from. To fix it, remove that copy and add it for all projects:
+
+```bash
+cd ~                                            # the folder you originally added it from
+claude mcp remove token-shrink --scope local
+claude mcp add token-shrink --scope user -- npx -y -p @ajdev0/token-shrink token-shrink-mcp
+```
+
+Then restart Claude Code in your project.
+
+> If you use `--scope user`, **don't** add `--root /some/project`. Every project would then get that one project's code.
+
+### It shows as failed in `/mcp`
+
+- Check your Node version with `node --version`. You need 18 or newer.
+- Run the server by hand to see its error: `npx -y -p @ajdev0/token-shrink token-shrink-mcp --root .`, then press Ctrl+C to stop it.
+- The first run downloads parsers from GitHub. Behind a firewall or offline, files are still indexed, but they aren't shrunk until the download succeeds.
+
+### Claude doesn't seem to use it
+
+- Check that `.claude/rules/token-shrink.md` exists in your project. If you started the server with `--no-create-rule`, ask Claude directly: "use get_compressed_code_context for src/app.ts".
+- The rule only applies to code files (`.ts`, `.py`, `.go` and so on), not to Markdown or JSON.
+
+### I'm getting an older version
+
+`npx` can reuse a version it downloaded earlier. To always get the newest, use `@ajdev0/token-shrink@latest` in the server command. Check what's published with `npm view @ajdev0/token-shrink version`.
+
+---
+
+## What your agent gets
+
+token-shrink adds four tools. **You don't call them yourself.** The rule file tells your agent when to use each one.
+
+| Tool | What it does | When it's used |
+| ---- | ------------ | -------------- |
+| `get_compressed_code_context` | Your file in full, plus skeletons of the files it imports | Before working on any code file |
+| `git_diff_context` | The changed files, their imports, and the files that call them | Reviews, multi-file edits, uncommitted changes |
+| `expand_symbol` | The complete code of one function, class or method | When a skeleton isn't enough |
+| `search_symbol_signatures` | Where something is defined, as `file:line — signature` lines | When a name isn't in the context yet |
+
+### What a skeleton looks like
+
+`src/user.ts` as written:
+
+```ts
+/**
+ * Builds the label shown next to a user's avatar. Falls back to
+ * the part of the email before the @ when no name is set.
+ * @param u the user to label
+ */
+export function displayName(u: User): string {
+  // prefer the real name when there is one
+  if (u.name) {
+    return u.name.trim();
+  }
+  return u.email.split('@')[0];
+}
+```
+
+What the agent receives:
+
+```ts
+/** Builds the label shown next to a user's avatar. @param u the user to label */
+export function displayName(u: User): string /* ... */
+```
+
+What gets trimmed:
+
+- **Function and method bodies**, in all languages.
+- **Long one-line arrow functions** (over 40 characters of expression).
+- **Large constant objects and arrays** (over 200 characters at the top of a file). Type annotations and `as const` values stay.
+- **Comments.** Doc comments shrink to their first sentence plus `@param` and `@returns`, and other comments are removed.
+- **Unused exports**, if you opt in with `ringOneMode: "used"`. A dependency then keeps only what your file imports from it.
+- **The active file, when it's too big for the budget.** Pass `focusLines` and only the function you're editing stays whole.
+
+The agent always gets the file it's actually editing in full, unless that file alone is bigger than the token budget.
+
+---
+
+## Project settings
+
+Optionally, add a `.tokenshrinkrc.json` file to your project root:
+
+```json
+{
+  "ignorePatterns": ["**/generated/**"],
+  "keepUnpruned": ["src/types/global.d.ts"],
+  "preserveAnnotations": ["@api"],
+  "ringOneMode": "used"
+}
+```
+
+| Setting | What it does |
+| ------- | ------------ |
+| `ignorePatterns` | Folders and files to leave out entirely (glob patterns). |
+| `keepUnpruned` | Files always sent in full, such as shared type definitions. |
+| `preserveAnnotations` | Mark a function with a comment such as `// @api` and its body is kept. |
+| `ringOneMode` | `"used"` keeps only the exports your file imports (TypeScript and JavaScript). The default, `"full"`, keeps the whole skeleton. |
+| `autoWorkflow` | `false` makes the rule file lighter, so the agent decides on its own when to use the extra tools. |
+
+The MCP server picks up changes to this file while it runs. If the JSON is invalid, a warning is logged and the defaults are used.
+
+---
+
+## Server options
+
+Add these after `token-shrink-mcp` in the server command.
+
+| Option | What it does |
+| ------ | ------------ |
+| `--root <folder>` | The project to work on. Optional; without it the project is detected automatically. Same as the `ROOT` environment variable. |
+| `--rule-target=claude` | Which rule files to write: `claude`, `cursor`, `cline` or `all` (default). Comma-separate several: `--rule-target=claude,cursor`. |
+| `--no-create-rule` | Don't write any rule files. Same as `TOKEN_SHRINK_CREATE_RULE=0`. |
+| `--no-stats` | Don't save savings to `.token-shrink/stats.json`. Same as `TOKEN_SHRINK_STATS=0`. |
+
+Example, for Claude Code only and without stats:
+
+```bash
+claude mcp add token-shrink --scope user -- npx -y -p @ajdev0/token-shrink token-shrink-mcp --rule-target=claude --no-stats
+```
+
+---
+
+## Supported languages
+
+| Language | File extensions |
+| -------- | --------------- |
+| TypeScript | `.ts` `.mts` `.cts` |
+| JavaScript | `.js` `.mjs` `.cjs` |
+| React (TSX / JSX) | `.tsx` `.jsx` |
+| Python | `.py` `.pyi` |
+| Go | `.go` |
+| Rust | `.rs` |
+| Java | `.java` |
+| Kotlin | `.kt` `.kts` |
+| Swift | `.swift` |
+| Dart / Flutter | `.dart` |
+| C | `.c` `.h` |
+| C++ | `.cc` `.cpp` `.cxx` `.hpp` `.hh` `.hxx` |
+| PHP | `.php` |
+
+Unused-exports filtering (`ringOneMode: "used"`) works for TypeScript and JavaScript; other languages get the full skeleton. In React files, `'use client'` / `'use server'` directives are kept.
+
+---
+
+## Updating
+
+- **With `npx`** (the setup above), you get new releases automatically. If an update doesn't arrive, use `@ajdev0/token-shrink@latest` in the server command and restart your agent.
+- **Rule files** (`.claude/rules/token-shrink.md` and the others) are upgraded automatically when a release changes them. A rule file you wrote yourself is never touched. Edits to a generated file are kept until a release changes the rule again, so put custom instructions in a separate rule file.
+
+---
+
+## Advanced
+
+### HTTP server
+
+For tools that aren't MCP clients, run a local HTTP server:
+
+```bash
+npx -y -p @ajdev0/token-shrink token-shrink --root . --port 3000
+```
+
+```bash
+curl -s -X POST http://localhost:3000/v1/context \
+  -H 'Content-Type: application/json' \
+  -d '{"activeFilePath": "./src/page.ts", "maxTokens": 8000}'
+```
+
+| Route | Method | Body | Returns |
+| ----- | ------ | ---- | ------- |
+| `/health` | `GET` | — | status, version, root, indexed file count |
+| `/v1/context` | `POST` | `{ activeFilePath \| activeFiles, maxTokens?, maxSkeletons?, focusLines?, ringOneMode?, includeStats? }` | `markdown`, `dependencies`, `unresolved`, `tokenStats` |
+
+`tokenStats` includes `originalTokens`, `totalTokens`, `savedTokens` and `reductionPct`. The server prints the yellow savings line after each request. Other options: `--host` (default `0.0.0.0`), `--max-tokens` (a default budget) and `--silent`. The HTTP server reads `.tokenshrinkrc.json` once at startup.
+
+### Library
+
+```bash
+npm install @ajdev0/token-shrink
+```
+
+```ts
+import { prune, createWatcher, assembleContext } from '@ajdev0/token-shrink';
+
+// One file → skeleton
+const { code } = await prune('src/user.ts', source);
+
+// A whole project, kept up to date as files change
+const watcher = createWatcher({ root: process.cwd() });
+await watcher.indexAll();
+const { markdown, tokenStats } = await assembleContext(['src/profile.ts'], watcher.cache.entries, {
+  maxTokens: 8000,
+  ringOneMode: 'used',
+});
+```
+
+Works with both `import` and `require`. Other exports include `analyze`, `assembleMany`, `formatSavings`, `readStats` and `gitChangedFiles`.
+
+### Tool reference
+
+**`get_compressed_code_context`**
+
+| Argument | Type | Description |
+| -------- | ---- | ----------- |
+| `activeFilePath` | `string` | The file being worked on. Use this or `activeFiles`. |
+| `activeFiles` | `string[]` | Several files to send in full; their imports are combined. |
+| `maxTokens` | `number` | Budget for the whole reply. Your files come first, then imports, most-used first. Anything that doesn't fit is listed in a note. |
+| `focusLines` | `number[]` or `{ [path]: number[] }` | Lines being edited. If your file alone exceeds `maxTokens`, only the definitions around these lines keep their bodies. |
+| `ringOneMode` | `"used"` \| `"full"` | Overrides the project setting for this call. |
+| `maxSkeletons` | `number` | Maximum number of imported files (default 50, max 200). |
+| `includeStats` | `boolean` | Adds token counts at the end of the reply. |
+
+**`git_diff_context`**: `scope` (`worktree` default, `staged`, or `branch` for `base...head`), `base`, `head`, `includeUntracked`, `maxFiles` (default 30), `maxImporters` (default 20), `maxSkeletons`, `maxTokens`, `ringOneMode`. With a budget, the reply is packed as changed files, then their imports, then the files calling them. If the changed files alone are over budget, they're trimmed to the changed definitions.
+
+**`expand_symbol`**: `filePath`, `symbolName`, `maxMatches`. Returns the complete definition, including all overloads.
+
+**`search_symbol_signatures`**: `query`, `kind`, `maxResults`. Matches are ranked exact, then prefix, then substring.
 
 ---
 
 ## How it works
 
-```
-       active file                       imports (Ring 1)
-  ┌──────────────────┐       ┌──────────────────────┐
-  │  src/page.ts     │  ──►  │  src/util.ts         │
-  └──────────────────┘       └──────────────────────┘
-          ▾                              ▾
-  tree-sitter (WASM) ─────────────► prune impl blocks
-       parse & query               keep interfaces · types ·
-                                   signatures · exports
-                                          ▾
-                                  pruned skeleton (Ring 0 full source)
-                                          ▾
-                          Compressed Code Context (Markdown)
-                                  │               │
-                            via MCP (stdio)   via HTTP (Fastify)
-                      get_compressed_code_context  POST /v1/context
+```text
+  your file (Ring 0)  ──imports──►  dependencies (Ring 1)  ◄──imports──  callers (Ring 2, git_diff_context)
+        full text                       skeletons                            skeletons
 ```
 
-Pipeline stages:
-
-1. **Parse** — `web-tree-sitter` loads a `.wasm` grammar per language (auto-downloaded on first run).
-2. **Prune** — an S-expression query matches implementation blocks (`statement_block`, `block`, `compound_statement`…), which are replaced with a short token (`/* ... */`, or `pass` for Python) using **descending-order splicing** so offsets stay valid (nested blocks collapse into their outermost one). For TS/JS, long expression-bodied arrows and large (200+ char) top-level object/array literals are collapsed too, doc comments are shortened to their first sentence plus `@param`/`@returns`, plain comments are dropped, and blank-line runs are squeezed.
-3. **Watch** — `chokidar` watches the repo, `sha1`-hashes file contents, and refreshes the cache only on change.
-4. **Assemble** — the active file's imports are resolved and merged into a Markdown context payload (Ring 0 + Ring 1).
+1. **Parse.** Each file is parsed with [tree-sitter](https://tree-sitter.github.io/), so cuts follow the real syntax instead of guesses. Parsers (`.wasm` files) are downloaded once, pinned to exact versions, and cached.
+2. **Prune.** Bodies, long arrows, large literals and comments are replaced with placeholders such as `/* ... */` (`pass` in Python). The result is still valid code.
+3. **Watch.** A file watcher re-prunes a file only when its contents change, so skeletons are ready before the agent asks.
+4. **Assemble.** Your file, its imports and, for reviews, its callers are packed into one Markdown reply, within the token budget if one is set.
 
 ---
 
-
-
-## Install
-
-Requires **Node.js 18+**.
+## Development
 
 ```bash
-# run anywhere without installing
-#   --root   project root   --port   http port   --host   bind address
-npx @ajdev0/token-shrink --root /path/to/project
-
-# or install locally
-npm install @ajdev0/token-shrink
-```
-
-
-
-### Build from source
-
-```bash
-# install deps
+git clone https://github.com/ajdev0/token-shrink.git
+cd token-shrink
 npm install
-
-# compile (tsup -> dist/), typecheck, and run tests
-npm run build
+npm run build        # compile to dist/
 npm run typecheck
-npm test
+npm test             # offline suite
+NETWORK=1 npx vitest run tests/grammars.test.ts   # downloads and checks every language parser
 ```
 
-The build produces three binaries:
-
-
-| Binary               | Entry           | Purpose                                      |
-| -------------------- | --------------- | -------------------------------------------- |
-| `@ajdev0/token-shrink`       | `dist/cli.cjs`   | Fastify HTTP server (`POST /v1/context`)     |
-| `@ajdev0/token-shrink-mcp`   | `dist/mcp.cjs`   | MCP stdio server for AI agents               |
-| library              | `dist/index.js` | `prune()`, `assemble()`, `createWatcher()` … |
-
-
----
-
-## WASM grammars (auto-download)
-
-Grammars are fetched from the official tree-sitter GitHub releases on **first use** and cached in `wasm/`:
-
-```text
-wasm/
-├── tree-sitter-typescript.wasm
-├── tree-sitter-javascript.wasm
-├── tree-sitter-tsx.wasm
-├── tree-sitter-python.wasm
-├── tree-sitter-go.wasm
-├── ...
-```
-
-- First run requires network access; afterwards everything is offline and fast.
-- Each grammar is pinned to an exact release that the bundled `web-tree-sitter` 0.27 runtime loads (tree-sitter ABI 13–15). Cache files are keyed by the pinned URL, so a new pin is fetched automatically, and a cached grammar the runtime can't load is re-downloaded.
-- Dart has no upstream wasm release; it comes from the [`@repomix/tree-sitter-wasms`](https://www.npmjs.com/package/@repomix/tree-sitter-wasms) prebuilt package.
-- Files are written atomically (`*.tmp` → rename) with an in-flight lock, so concurrent first-run parses never corrupt the cache.
-
----
-
-
-
-## Usage
-
-
-
-### 1. MCP server (AI agents — Cursor, Claude, Cline, etc.)
-
-Run the stdio MCP server and expose the `get_compressed_code_context` tool:
-
-```bash
-# point it at your project
-token-shrink-mcp --root /path/to/project
-
-# root also works via env or cwd
-ROOT=/path/to/project token-shrink-mcp
-cd /path/to/project && token-shrink-mcp
-```
-
-> **Zero-config auto-detect**: `--root` is optional. When neither `--root` nor
-> `ROOT` is set, the server finds the project itself — it walks up for VCS
-> directories (`.git`/`.hg`/`.svn`) or project manifests (`package.json`,
-> `pyproject.toml`, `go.mod`, `Cargo.toml`, …), first around the directory the
-> client launched it from, and otherwise lazily from the `activeFilePath` of the
-> first `get_compressed_code_context` call (re-pointing if a later call opens a
-> different project). The config examples below keep `--root` so the behavior is
-> pinned and the index is already warm before the first request — but you may
-> simply drop the `--root` argument entirely.
-
-**Cursor MCP config** (`.cursor/mcp.json`):
-
-```json
-{
-  "mcpServers": {
-    "token-shrink": {
-      "command": "token-shrink-mcp",
-      "args": ["--root", "/absolute/path/to/your/project"]
-    }
-  }
-}
-```
-
-**Claude Code MCP config** — add it to the project's `.mcp.json`, or register with the Claude CLI:
-
-```bash
-# register the server for this project
-claude mcp add token-shrink -- token-shrink-mcp --root /path/to/project
-# persistent flag: -- transport stdio
-claude mcp add token-shrink --transport stdio -- token-shrink-mcp --root /path/to/project
-```
-
-or place in `.claude/settings.json` / project `.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "token-shrink": {
-      "command": "token-shrink-mcp",
-      "args": ["--root", "/path/to/project"]
-    }
-  }
-}
-```
-
-**Cline MCP config** — add it to the project's `.mcp.json` (or `mcp.json` in the `.cline` settings directory), or add the server via the Cline UI (**MCP Servers → Configure MCP Servers**):
-
-```json
-{
-  "mcpServers": {
-    "token-shrink": {
-      "command": "token-shrink-mcp",
-      "args": ["--root", "/path/to/project"]
-    }
-  }
-}
-```
-
-**Auto rule**: by default the server writes agent integration rules so the tool is used automatically on every prompt:
-
-- **Cursor**: `.cursor/rules/token-shrink.mdc`
-- **Claude Code**: `.claude/rules/token-shrink.md`
-- **Cline**: `.clinerules/token-shrink.md` (Cline's `.clinerules/` directory — every `.md`/`.txt` file there is loaded on every task)
-
-All are sentinel-tagged and never rewrite a user-authored file at the same path. Repeated starts are no-ops. Choose the target(s) with `--rule-target=cursor|claude|cline|all` (default `all`, comma-separated values allowed):
-
-```bash
-# only Claude Code
-token-shrink-mcp --root /path/to/project --rule-target=claude
-
-# Cursor + Cline, no Claude rule
-token-shrink-mcp --root /path/to/project --rule-target=cursor,cline
-
-# completely disable auto-rules
-token-shrink-mcp --root /path/to/project --no-create-rule
-```
-
-Opt out also via `--create-rule=false` or `TOKEN_SHRINK_CREATE_RULE=0`.
-
-**MCP tools**
-
-`get_compressed_code_context` — compressed context for one or more active files (Ring 0 full, Ring 1 pruned):
-
-| Argument         | Type       | Required | Description                                        |
-| ---------------- | ---------- | -------- | -------------------------------------------------- |
-| `activeFilePath` | `string`   | no*      | Single file the agent is working on                |
-| `activeFiles`    | `string[]` | no*      | Multiple Ring-0 files (combined Ring 1)            |
-| `maxSkeletons`   | `number`   | no       | Cap on Ring-1 files (default `50`, max `200`)      |
-| `maxTokens`      | `number`   | no       | Budget for the whole rendered payload (headings and fences included); Ring 1 is relevance-packed into what Ring 0 leaves. Ring 0 is never cut, so if it alone is too big the payload says so |
-| `includeStats`   | `boolean`  | no       | Append approximate token counts                    |
-| `focusLines`     | `number[]` \| `{ [path]: number[] }` | no | 1-based lines being edited; when Ring 0 alone exceeds `maxTokens`, only the definitions around them keep their bodies |
-| `ringOneMode`    | `"used"` \| `"full"` | no | `used`: Ring-1 skeletons keep only the exports Ring 0 imports (default from config, else `full`) |
-
-\* Provide exactly one of `activeFilePath` / `activeFiles`. Ring 0 stays full; Ring 1 is the union of each file's local imports, minus files already in Ring 0.
-
-`expand_symbol({ filePath, symbolName, maxMatches? })` — when a skeleton isn't enough, returns the **full, un-pruned definition** (function/class/method/… bodies included) for the named symbol in that file. Overloads and same-named members are all returned.
-
-`git_diff_context({ scope?, base?, head?, includeUntracked?, maxFiles?, maxImporters?, maxSkeletons?, maxTokens?, ringOneMode? })` — impact analysis for changed code:
-- when the changed files alone exceed `maxTokens`, they are focused on the diff: the definitions containing changed lines stay in full, other bodies are pruned.
-- `scope`: `worktree` (default) · `staged` · `branch` (`base...head`, defaults `HEAD~1...HEAD`)
-- changed files are emitted in full as Ring 0; their imports **and** the files that import them (file-level callers) are attached as pruned skeletons. Great for PR reviews and multi-file regressions where there is no single active file.
-- with `maxTokens`, the payload is packed in order: changed files → their imports (Ring 1) → callers (Ring 2, those importing the most changed files first). Callers that don't fit are listed in a note.
-
-`search_symbol_signatures({ query, maxResults?, kind? })` — repo-wide lookup of definitions backed by an in-memory index of the tree-sitter symbol pass. Returns compact `` `file:line — signature` `` lines (not raw file dumps), ranked exact → prefix → substring.
-
-**Project config (`.tokenshrinkrc.json`)** at the repository root — hot-reloaded:
-
-```json
-{
-  "ignorePatterns": ["**/dist/**", "**/generated/**"],
-  "keepUnpruned": ["src/types/global.d.ts", "lib/models/*.dart"],
-  "preserveAnnotations": ["@keepContext", "@api"],
-  "ringOneMode": "used"
-}
-```
-
-- `ignorePatterns` — globs that are never indexed or watched.
-- `keepUnpruned` — files that are indexed but never pruned (always full text).
-- `preserveAnnotations` — definitions (and everything nested in them) preceded by `@marker` are kept fully un-pruned.
-- `ringOneMode` — `"used"` trims each TS/JS dependency skeleton to the exports the active files import (`import { a } from './x'`), plus the declarations their signatures reference and any `export … from` lines. Namespace (`* as`), side-effect, `require` and dynamic imports, CommonJS files and non-JS languages keep the full skeleton. Default `"full"`.
-
-Invalid JSON logs a warning and falls back to defaults; editing the file while the server runs re-indexes automatically.
-
-### 2. HTTP server (Fastify)
-
-```bash
-token-shrink --root /path/to/project --port 3000 --max-tokens 4000
-# env equivalents: ROOT=… PORT=… HOST=…
-```
-
-| Route         | Method | Body                                                   | Returns                          |
-| ------------- | ------ | ------------------------------------------------------ | -------------------------------- |
-| `/health`     | `GET`  | —                                                      | status, root, indexed file count |
-| `/v1/context` | `POST` | `{ activeFilePath? \| activeFiles?, maxSkeletons?, maxTokens?, includeStats?, focusLines?, ringOneMode? }` | assembled Markdown + deps + stats |
-
-
-```bash
-curl -s http://localhost:3000/health
-# {"status":"ok","service":"token-shrink","version":"2.0.0","root":".","indexed":182}
-
-curl -s -X POST http://localhost:3000/v1/context \
-  -H 'Content-Type: application/json' \
-  -d '{"activeFiles":["./src/page.ts","./src/api.ts"],"includeStats":true}'
-```
-
-
-
-### 3. Library API
-
-```ts
-import { prune, assemble, createWatcher } from 'token-shrink';
-
-// prune a single file -> skeleton (keeps signatures, strips bodies)
-const { code, removed } = await prune('src/util.ts', sourceText);
-
-// assemble context for an active file from a warm cache
-const { markdown } = assemble('src/page.ts', watcher.cache.entries, {
-  includeStats: true,
-});
-
-// incremental watcher
-const watcher = createWatcher({ root: process.cwd(), ignored: ['node_modules'] });
-await watcher.indexAll();
-```
-
----
-
-
-
-## See your savings
-
-Every context call is measured against what the same files would cost un-pruned, and the result is printed **in yellow**:
-
-```text
-⚡ token-shrink: 10,645 → 4,263 tokens (−6,382 · 60% saved)
-```
-
-- **Claude Code status line**: copy `hooks/claude/statusline.mjs` and merge the `statusLine` block from `hooks/claude/settings.example.json` (see `hooks/claude/README.md`). Shows the last call and the session total.
-- **HTTP server**: logged after each `POST /v1/context`. `tokenStats` in the response also carries `originalTokens`, `savedTokens` and `reductionPct`.
-- **MCP server**: written to stderr (visible in `claude --debug` / Cursor's MCP log). The model-facing `[stats]` line gets a plain `original=… saved=… (…%)` suffix.
-- **Any time**: `token-shrink stats --root /path/to/project` prints the last call, the session and the all-time totals.
-
-Totals live in `<root>/.token-shrink/stats.json` (add it to `.gitignore`). Disable with `--no-stats` or `TOKEN_SHRINK_STATS=0`. Color follows the terminal; `FORCE_COLOR=1` / `NO_COLOR=1` override it.
-
----
-
-
-
-## Supported languages
-
-S-expression queries match implementation blocks; interfaces, signatures, and exports are never touched. The `Block node` column shows the AST node that gets collapsed during pruning.
-
-
-| Language        | Extensions                              | Grammar wasm                  | Block node           |
-| --------------- | --------------------------------------- | ----------------------------- | -------------------- |
-| TypeScript      | `.ts` `.cts` `.mts`                     | `tree-sitter-typescript.wasm` | `statement_block`    |
-| JavaScript      | `.js` `.cjs` `.mjs`                     | `tree-sitter-javascript.wasm` | `statement_block`    |
-| React / Next.js | `.tsx`                                  | `tree-sitter-tsx.wasm`        | `statement_block`¹   |
-| React (JSX)     | `.jsx`                                  | `tree-sitter-javascript.wasm` | `statement_block`¹   |
-| Python          | `.py` `.pyi`                            | `tree-sitter-python.wasm`     | `block` → `pass`     |
-| Dart / Flutter  | `.dart`                                 | `tree-sitter-dart.wasm`       | `block`              |
-| Swift / SwiftUI | `.swift`                                | `tree-sitter-swift.wasm`      | `statements`         |
-| Go              | `.go`                                   | `tree-sitter-go.wasm`         | `block`              |
-| Rust            | `.rs`                                   | `tree-sitter-rust.wasm`       | `block`              |
-| Java            | `.java`                                 | `tree-sitter-java.wasm`       | `block`              |
-| Kotlin          | `.kt` `.kts`                            | `tree-sitter-kotlin.wasm`     | `function_body`      |
-| C               | `.c` `.h`                               | `tree-sitter-c.wasm`          | `compound_statement` |
-| C++             | `.cc` `.cpp` `.cxx` `.hpp` `.hh` `.hxx` | `tree-sitter-cpp.wasm`        | `compound_statement` |
-| PHP             | `.php`                                  | `tree-sitter-php.wasm`        | `compound_statement` |
-
-
-> ¹ TSX/JSX also preserve `'use client'` / `'use server'` directive lines inside otherwise-pruned bodies (framework-aware).
-
-Language IDs: `typescript · javascript · tsx · jsx · python · dart · swift · go · rust · java · kotlin · c · cpp · php`.
-
----
-
-
-
-## Example
-
-**Input** `src/util.ts`
-
-```ts
-export interface User {
-  id: number;
-  name: string;
-}
-export function buildGreeting(u: User) {
-  const parts = [u.name, u.email];
-  return parts.join(' | ');
-}
-export const formatEmail = (u: User) => {
-  return u.email.toLowerCase().trim();
-};
-```
-
-**Pruned skeleton (Ring 1)** — signatures and the interface intact, bodies collapsed:
-
-```ts
-export interface User {
-  id: number;
-  name: string;
-}
-export function buildGreeting(u: User) /* ... */
-export const formatEmail = (u: User) => { /* ... */ };
-```
-
----
-
-
-
-## Design notes
-
-- **Bottom-up splicing** — ranges are sorted by start index descending and replaced in place, so earlier offsets never shift and the output stays a valid, parseable file.
-- **Regex-based import extraction** — resilient across languages; resolves relative imports (`./x`, `../y`), aliases (`@/`, `~`), and skips bare package specifiers.
-- **Incremental hashing** — files are re-pruned only when their `sha1` hash changes; the watcher is debounced (100 ms) and zero-CPU while idle.
-- **Ram-safe watchers** — sockets / non-regular files are never opened with `fs.watch`, so stray unix sockets in the tree can't crash the server.
-
----
-
-
-
-## Project layout
-
-```
-token-shrink/
-├── package.json / tsconfig.json / tsup.config.ts / vitest.config.ts
-├── src/
-│   ├── index.ts             # library entry (exports)
-│   ├── cli.ts               # Fastify HTTP server
-│   ├── mcp.ts               # MCP stdio server
-│   ├── parser/
-│   │   ├── registry.ts      # extension → language spec + S-queries
-│   │   ├── wasm.ts          # auto-download + cache of .wasm files
-│   │   └── pruner.ts        # prune(filePath, source) → skeleton
-│   ├── watcher/
-│   │   └── sync.ts          # chokidar watch + hash cache + import graph
-│   └── server/
-│       └── assembler.ts     # Ring 0 + Ring 1 Markdown payload
-├── tests/                   # pruning integrity + token-reduction tests
-└── wasm/                    # auto-downloaded grammars (gitignored)
-```
-
-
+Releases are published to npm by `.github/workflows/publish.yml` when a version tag is pushed (`npm version minor && git push --follow-tags`).
 
 ## License
 

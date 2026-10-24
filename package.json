@@ -4,6 +4,10 @@
   "description": "Polyglot AST Semantic Proxy & MCP Server — local-first, framework-aware token reduction engine",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ajdev0/token-shrink.git"
+  },
   "keywords": [
     "token-reduction",
     "tree-sitter",

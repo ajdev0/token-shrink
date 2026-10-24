@@ -763,14 +763,25 @@ export async function startMcpServer(opts: McpServerOptions = {}): Promise<McpSe
           importerOf.set(imp, list);
         }
       }
-      const importerList = [...new Set([...importerOf.values()].flat())].filter(
-        (f) => !changedSet.has(f),
-      );
+      // Ring-2 candidates, most relevant first: importers of more changed files,
+      // then shallower paths, then discovery order.
+      const importsChanged = new Map<string, number>();
+      for (const list of importerOf.values()) {
+        for (const f of list) importsChanged.set(f, (importsChanged.get(f) ?? 0) + 1);
+      }
+      const importerList = [...importsChanged.keys()]
+        .filter((f) => !changedSet.has(f))
+        .map((f, idx) => ({ f, idx }))
+        .sort(
+          (a, b) =>
+            importsChanged.get(b.f)! - importsChanged.get(a.f)! ||
+            a.f.split(path.sep).length - b.f.split(path.sep).length ||
+            a.idx - b.idx,
+        )
+        .map((x) => x.f);
       const importerCap = maxImporters ?? 20;
-      const importers = importerList.slice(0, importerCap);
-      const importersTruncated = importerList.length > importers.length;
-      let importerTokens = 0;
-      let importerOriginalTokens = 0;
+      const candidates = importerList.slice(0, importerCap);
+      const cappedOut = importerList.length - candidates.length;
 
       const relLabel = (abs: string) => {
         const rel = path.relative(repoRoot, abs);
@@ -778,88 +789,121 @@ export async function startMcpServer(opts: McpServerOptions = {}): Promise<McpSe
       };
       const fence = (abs: string) => path.extname(abs).replace(/^\./, '') || 'text';
 
-      const parts: string[] = [];
-      parts.push(
-        `# Git Impact Context (${changed.length} changed file${changed.length === 1 ? '' : 's'})`,
-        '',
-      );
-      parts.push(`- changed files: ${changed.map(relLabel).join(', ')}`);
-      if (importers.length > 0) {
-        parts.push(`- importing files (callers): ${importers.map(relLabel).join(', ')}`);
-      }
-      parts.push('', '---', '');
-      parts.push(
-        assembled.ring0Focused
-          ? '## Changed files — focused on the diff (other bodies pruned to fit the token budget)'
-          : '## Changed files — full code',
-        '',
-      );
-      changed.forEach((abs, i) => {
-        parts.push(`### \`${relLabel(abs)}\``, '');
-        const text = assembled.ring0Texts[i] ?? '';
-        parts.push(`\`\`\`${fence(abs)}`, text.trim() || '(unreadable file)', '```', '');
-      });
-      parts.push(`## Ring 1 — Pruned dependencies (${assembled.included.length})`, '');
-      parts.push('', 'Implementation bodies removed; type signatures, interfaces and exports retained.', '');
-      if (assembled.included.length === 0) {
-        parts.push('_No local dependency skeletons available._', '');
-      }
-      for (const inc of assembled.included) {
-        const label = relLabel(inc.filePath);
-        parts.push(`### \`${label}\`${inc.usedOnly ? ' (used exports only)' : ''}`, '');
-        if (inc.skeleton !== undefined) {
-          parts.push(`\`\`\`${fence(inc.filePath)}`, inc.skeleton.trim(), '```', '');
-        } else {
-          parts.push('_Unindexed file._', '');
-        }
-        parts.push('');
-      }
-      if (assembled.tokenStats.budget !== undefined && assembled.tokenStats.trimmed > 0) {
+      // Renders the whole payload for a chosen set of Ring-2 importers.
+      // `budgetTrimmed` > 0 adds the "excluded by the token budget" note.
+      const render = (importers: string[], budgetTrimmed: number): string => {
+        const parts: string[] = [];
         parts.push(
-          `_Note: token budget of ${assembled.tokenStats.budget} excluded ` +
-            `${assembled.tokenStats.trimmed} lower-priority dependencies._`,
+          `# Git Impact Context (${changed.length} changed file${changed.length === 1 ? '' : 's'})`,
           '',
         );
-      }
-
-      if (importers.length > 0) {
-        parts.push(`## Ring 2 — Files importing the diff (${importers.length})`, '');
-        for (const abs of importers) {
-          const entry = watcher.cache.entries.get(abs);
-          if (!entry) continue;
-          const cost = approximateTokens(entry.skeleton);
-          importerTokens += cost;
-          importerOriginalTokens += entry.originalTokens ?? cost;
+        parts.push(`- changed files: ${changed.map(relLabel).join(', ')}`);
+        if (importers.length > 0) {
+          parts.push(`- importing files (callers): ${importers.map(relLabel).join(', ')}`);
         }
-        parts.push('', 'Pruned skeletons of modules that call into the changed files.', '');
-        for (const abs of importers) {
-          const entry = watcher.cache.entries.get(abs);
+        parts.push('', '---', '');
+        parts.push(
+          assembled.ring0Focused
+            ? '## Changed files — focused on the diff (other bodies pruned to fit the token budget)'
+            : '## Changed files — full code',
+          '',
+        );
+        changed.forEach((abs, i) => {
           parts.push(`### \`${relLabel(abs)}\``, '');
-          if (entry) {
-            parts.push(`\`\`\`${fence(abs)}`, entry.skeleton.trim(), '```', '');
+          const text = assembled.ring0Texts[i] ?? '';
+          parts.push(`\`\`\`${fence(abs)}`, text.trim() || '(unreadable file)', '```', '');
+        });
+        parts.push(`## Ring 1 — Pruned dependencies (${assembled.included.length})`, '');
+        parts.push('', 'Implementation bodies removed; type signatures, interfaces and exports retained.', '');
+        if (assembled.included.length === 0) {
+          parts.push('_No local dependency skeletons available._', '');
+        }
+        for (const inc of assembled.included) {
+          const label = relLabel(inc.filePath);
+          parts.push(`### \`${label}\`${inc.usedOnly ? ' (used exports only)' : ''}`, '');
+          if (inc.skeleton !== undefined) {
+            parts.push(`\`\`\`${fence(inc.filePath)}`, inc.skeleton.trim(), '```', '');
           } else {
             parts.push('_Unindexed file._', '');
           }
           parts.push('');
         }
-        if (importersTruncated) {
+        if (assembled.tokenStats.budget !== undefined && assembled.tokenStats.trimmed > 0) {
           parts.push(
-            `_…and ${importerList.length - importers.length} more importing files (raise maxImporters)._`,
+            `_Note: token budget of ${assembled.tokenStats.budget} excluded ` +
+              `${assembled.tokenStats.trimmed} lower-priority dependencies._`,
             '',
           );
         }
+
+        if (importers.length > 0) {
+          parts.push(`## Ring 2 — Files importing the diff (${importers.length})`, '');
+          parts.push('', 'Pruned skeletons of modules that call into the changed files.', '');
+          for (const abs of importers) {
+            const entry = watcher!.cache.entries.get(abs);
+            parts.push(`### \`${relLabel(abs)}\``, '');
+            if (entry) {
+              parts.push(`\`\`\`${fence(abs)}`, entry.skeleton.trim(), '```', '');
+            } else {
+              parts.push('_Unindexed file._', '');
+            }
+            parts.push('');
+          }
+        }
+        if (budgetTrimmed > 0) {
+          parts.push(
+            `_Note: token budget of ${maxTokens} excluded ${budgetTrimmed} importing ` +
+              `file${budgetTrimmed === 1 ? '' : 's'}._`,
+            '',
+          );
+        }
+        if (cappedOut > 0) {
+          parts.push(
+            `_…and ${cappedOut} more importing files (raise maxImporters)._`,
+            '',
+          );
+        }
+        if (filesTruncated) {
+          parts.push(
+            `_Note: capped to ${fileCap} changed files (${changedResult.files.length} total); ` +
+              'raise maxFiles to include more._',
+            '',
+          );
+        }
+        if (assembled.unresolved.length > 0) {
+          parts.push('## Unresolved imports', '');
+          for (const u of assembled.unresolved) parts.push(`- \`${u}\``);
+          parts.push('');
+        }
+        return parts.join('\n');
+      };
+
+      // Ring 2 gets whatever budget Ring 0 + Ring 1 left. Packing measures the
+      // real rendered payload, always reserving the budget note's line.
+      const importers: string[] = [];
+      for (const abs of candidates) {
+        if (
+          maxTokens === undefined ||
+          approximateTokens(render([...importers, abs], 1)) <= maxTokens
+        ) {
+          importers.push(abs);
+        }
       }
-      if (filesTruncated) {
-        parts.push(
-          `_Note: capped to ${fileCap} changed files (${changedResult.files.length} total); ` +
-            'raise maxFiles to include more._',
-          '',
-        );
+      const budgetTrimmed = candidates.length - importers.length;
+      let payload = render(importers, budgetTrimmed);
+      if (maxTokens !== undefined && approximateTokens(payload) > maxTokens) {
+        payload +=
+          `\n_Note: the changed files alone exceed the token budget of ${maxTokens}; ` +
+          'they are never trimmed (only focused on the diff)._\n';
       }
-      if (assembled.unresolved.length > 0) {
-        parts.push('## Unresolved imports', '');
-        for (const u of assembled.unresolved) parts.push(`- \`${u}\``);
-        parts.push('');
+      let importerTokens = 0;
+      let importerOriginalTokens = 0;
+      for (const abs of importers) {
+        const entry = watcher.cache.entries.get(abs);
+        if (!entry) continue;
+        const cost = approximateTokens(entry.skeleton);
+        importerTokens += cost;
+        importerOriginalTokens += entry.originalTokens ?? cost;
       }
 
       const ts = assembled.tokenStats;
@@ -872,11 +916,12 @@ export async function startMcpServer(opts: McpServerOptions = {}): Promise<McpSe
       reportSavings('git_diff_context', gitSavings);
       const stats =
         `[git-stats] files=${changed.length} ring1=${assembled.included.length} ` +
-        `importers=${importers.length} unresolved=${assembled.unresolved.length} ` +
+        `importers=${importers.length}${budgetTrimmed > 0 ? ` importersTrimmed=${budgetTrimmed}` : ''} ` +
+        `unresolved=${assembled.unresolved.length} ` +
         `tokens=${gitSavings.totalTokens}${savingsNote(gitSavings)}${budgetNote}`;
       return {
         content: [
-          { type: 'text' as const, text: parts.join('\n') },
+          { type: 'text' as const, text: payload },
           { type: 'text' as const, text: stats },
         ],
       };

@@ -91,6 +91,7 @@ wasm/
 ```
 
 - First run requires network access; afterwards everything is offline and fast.
+- Each grammar is pinned to a release built for tree-sitter ABI 13–14, the range the bundled `web-tree-sitter` 0.24 runtime loads (newer upstream releases target ABI 15). A cached grammar the runtime can't load is replaced with the pinned one automatically.
 - Files are written atomically (`*.tmp` → rename) with an in-flight lock, so concurrent first-run parses never corrupt the cache.
 
 ---
@@ -202,7 +203,7 @@ Opt out also via `--create-rule=false` or `TOKEN_SHRINK_CREATE_RULE=0`.
 | `activeFilePath` | `string`   | no*      | Single file the agent is working on                |
 | `activeFiles`    | `string[]` | no*      | Multiple Ring-0 files (combined Ring 1)            |
 | `maxSkeletons`   | `number`   | no       | Cap on Ring-1 files (default `50`, max `200`)      |
-| `maxTokens`      | `number`   | no       | Hard token budget; Ring 1 is relevance-packed to fit |
+| `maxTokens`      | `number`   | no       | Budget for the whole rendered payload (headings and fences included); Ring 1 is relevance-packed into what Ring 0 leaves. Ring 0 is never cut, so if it alone is too big the payload says so |
 | `includeStats`   | `boolean`  | no       | Append approximate token counts                    |
 | `focusLines`     | `number[]` \| `{ [path]: number[] }` | no | 1-based lines being edited; when Ring 0 alone exceeds `maxTokens`, only the definitions around them keep their bodies |
 | `ringOneMode`    | `"used"` \| `"full"` | no | `used`: Ring-1 skeletons keep only the exports Ring 0 imports (default from config, else `full`) |
@@ -215,6 +216,7 @@ Opt out also via `--create-rule=false` or `TOKEN_SHRINK_CREATE_RULE=0`.
 - when the changed files alone exceed `maxTokens`, they are focused on the diff: the definitions containing changed lines stay in full, other bodies are pruned.
 - `scope`: `worktree` (default) · `staged` · `branch` (`base...head`, defaults `HEAD~1...HEAD`)
 - changed files are emitted in full as Ring 0; their imports **and** the files that import them (file-level callers) are attached as pruned skeletons. Great for PR reviews and multi-file regressions where there is no single active file.
+- with `maxTokens`, the payload is packed in order: changed files → their imports (Ring 1) → callers (Ring 2, those importing the most changed files first). Callers that don't fit are listed in a note.
 
 `search_symbol_signatures({ query, maxResults?, kind? })` — repo-wide lookup of definitions backed by an in-memory index of the tree-sitter symbol pass. Returns compact `` `file:line — signature` `` lines (not raw file dumps), ranked exact → prefix → substring.
 
@@ -313,17 +315,19 @@ S-expression queries match implementation blocks; interfaces, signatures, and ex
 | React / Next.js | `.tsx`                                  | `tree-sitter-tsx.wasm`        | `statement_block`¹   |
 | React (JSX)     | `.jsx`                                  | `tree-sitter-javascript.wasm` | `statement_block`¹   |
 | Python          | `.py` `.pyi`                            | `tree-sitter-python.wasm`     | `block` → `pass`     |
-| Dart / Flutter  | `.dart`                                 | `tree-sitter-dart.wasm`       | `block`              |
+| Dart / Flutter  | `.dart`                                 | `tree-sitter-dart.wasm`       | — (indexed unpruned)² |
 | Swift / SwiftUI | `.swift`                                | `tree-sitter-swift.wasm`      | `statements`         |
 | Go              | `.go`                                   | `tree-sitter-go.wasm`         | `block`              |
 | Rust            | `.rs`                                   | `tree-sitter-rust.wasm`       | `block`              |
 | Java            | `.java`                                 | `tree-sitter-java.wasm`       | `block`              |
-| Kotlin          | `.kt` `.kts`                            | `tree-sitter-kotlin.wasm`     | `block`              |
+| Kotlin          | `.kt` `.kts`                            | `tree-sitter-kotlin.wasm`     | `function_body`      |
 | C               | `.c` `.h`                               | `tree-sitter-c.wasm`          | `compound_statement` |
 | C++             | `.cc` `.cpp` `.cxx` `.hpp` `.hh` `.hxx` | `tree-sitter-cpp.wasm`        | `compound_statement` |
 | PHP             | `.php`                                  | `tree-sitter-php.wasm`        | `compound_statement` |
 
 
+> ² No prebuilt Dart grammar for ABI 13–14 exists, so Dart files are currently kept in full (no pruning, no symbol search) until the runtime is upgraded.
+>
 > ¹ TSX/JSX also preserve `'use client'` / `'use server'` directive lines inside otherwise-pruned bodies (framework-aware).
 
 Language IDs: `typescript · javascript · tsx · jsx · python · dart · swift · go · rust · java · kotlin · c · cpp · php`.

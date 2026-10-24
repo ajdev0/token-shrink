@@ -19,6 +19,7 @@ import type { GraphCache } from '../watcher/sync.js';
 import { approximateTokens } from '../tokens.js';
 import {
   assembleMany,
+  fileBlockOverhead,
   MARKDOWN_OVERHEAD_TOKENS,
   resolveLocal,
   type AssembleOptions,
@@ -152,8 +153,11 @@ export async function assembleContext(
     Object.entries(opts.focusLines ?? {}).map(([p, lines]) => [path.resolve(p), lines]),
   );
   if (opts.maxTokens !== undefined && focus.size > 0) {
-    const ring0Tokens = [...sources.values()].reduce((acc, t) => acc + approximateTokens(t), 0);
-    if (ring0Tokens > opts.maxTokens - MARKDOWN_OVERHEAD_TOKENS) {
+    const ring0Tokens = absList.reduce(
+      (acc, abs) => acc + approximateTokens(sources.get(abs) ?? '') + fileBlockOverhead(abs),
+      MARKDOWN_OVERHEAD_TOKENS,
+    );
+    if (ring0Tokens > opts.maxTokens) {
       for (const abs of absList) {
         const lines = focus.get(abs);
         if (!lines?.length || keepFull(abs)) continue;

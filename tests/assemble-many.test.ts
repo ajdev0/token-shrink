@@ -68,7 +68,6 @@ describe('assembleMany (multi-file Ring 0 + token budgets)', () => {
   it('enforces maxTokens by trimming lower-priority dependencies', () => {
     const big = path.join(dir, 'src', 'big.ts');
     const small = path.join(dir, 'src', 'small.ts');
-    const mainSource = "import { big } from './big';\nimport { small } from './small';\nexport const m = 1;\n";
     fs.writeFileSync(big, 'export const big = 1;'.repeat(400)); // ~large
     fs.writeFileSync(small, 'export const small = 1;\n');
 
@@ -80,10 +79,10 @@ describe('assembleMany (multi-file Ring 0 + token budgets)', () => {
       [small, entry(smallSkeleton)],
     ]);
 
-    const activeTokens = approximateTokens(mainSource);
-    const smallTokens = approximateTokens(smallSkeleton);
-    // Budget fits the active file + the small dep (+ markdown overhead), not big.
-    const maxTokens = activeTokens + smallTokens + 45;
+    // Budget: exactly what the payload with only `small` costs, plus room
+    // for the "excluded 1 dependency" note — so big cannot fit.
+    const withSmall = assembleMany([a], new Map([...cache].filter(([p]) => p !== big)));
+    const maxTokens = approximateTokens(withSmall.markdown) + 20;
     const res = assembleMany([a], cache, { maxTokens });
 
     expect(res.included.map((i) => i.filePath)).toEqual([small]);
@@ -103,5 +102,38 @@ describe('assembleMany (multi-file Ring 0 + token budgets)', () => {
 
     const res = assembleMany([a], cache);
     expect(res.included.map((i) => i.filePath)).toEqual([y, x]);
+  });
+});
+
+describe('maxTokens is a whole-payload budget', () => {
+  it('keeps the emitted markdown within maxTokens when Ring 0 fits', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-budget-'));
+    const main = path.join(dir, 'main.ts');
+    const deps = Array.from({ length: 12 }, (_, i) => path.join(dir, `d${i}.ts`));
+    fs.writeFileSync(main, deps.map((_, i) => `import { d${i} } from './d${i}';`).join('\n'));
+    const cache: GraphCache = new Map([
+      [main, entry('SKEL_MAIN', deps)],
+      ...deps.map((d, i) => [d, entry(`export declare function d${i}(a: number, b: string): Promise<void>;`)] as const),
+    ]);
+    // maxTokens 0: Ring 0 alone (always kept) plus the trimmed note.
+    const floor = approximateTokens(assembleMany([main], cache, { maxTokens: 0 }).markdown);
+    for (const maxTokens of [floor + 40, floor + 100, floor + 250]) {
+      const res = assembleMany([main], cache, { maxTokens });
+      expect(approximateTokens(res.markdown)).toBeLessThanOrEqual(maxTokens);
+      expect(res.tokenStats.trimmed).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('Ring 0 over budget', () => {
+  it('keeps Ring 0 and says it exceeds the budget', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-over-'));
+    const main = path.join(dir, 'main.ts');
+    fs.writeFileSync(main, 'export const big = 1;\n'.repeat(50));
+    const res = assembleMany([main], new Map(), { maxTokens: 10 });
+    expect(res.ring0Texts[0]).toContain('export const big = 1;');
+    expect(res.markdown).toContain('alone exceed the token budget of 10');
+    const fits = assembleMany([main], new Map(), { maxTokens: 100_000 });
+    expect(fits.markdown).not.toContain('alone exceed');
   });
 });

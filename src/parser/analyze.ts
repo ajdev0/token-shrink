@@ -67,11 +67,34 @@ export function loadLanguage(
   if (force) languageCache.delete(spec.wasm);
   return (async () => {
     await ensureParserInit();
-    const grammar = await getGrammar(spec, force);
-    const language = await Parser.Language.load(grammar);
+    let language = await Parser.Language.load(await getGrammar(spec, force));
+    // A cached grammar from an older, unpinned download may target a newer
+    // ABI than this runtime: replace it with the pinned release once.
+    if (!force && !isCompatible(language)) {
+      language = await Parser.Language.load(await getGrammar(spec, true));
+    }
+    if (!isCompatible(language)) {
+      throw new Error(
+        `Grammar "${spec.wasm}" uses tree-sitter ABI ${language.version}, ` +
+          'which the bundled web-tree-sitter runtime cannot load.',
+      );
+    }
     languageCache.set(spec.wasm, language);
     return language;
   })();
+}
+
+/** Whether this runtime can use `language` (setLanguage throws otherwise). */
+function isCompatible(language: Parser.Language): boolean {
+  const probe = new Parser();
+  try {
+    probe.setLanguage(language);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    probe.delete();
+  }
 }
 
 /**

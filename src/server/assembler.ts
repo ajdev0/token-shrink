@@ -30,6 +30,10 @@ export interface AssembleOptions {
   maxTokens?: number;
   /** Whether the active file itself should also be pruned (Ring 0 raw by default). */
   pruneActiveFile?: boolean;
+  /** Ring-0 text to emit instead of the full source (focused slimming), by absolute path. */
+  ring0Overrides?: Map<string, string>;
+  /** Ring-1 text to emit instead of the cached skeleton (used exports), by absolute path. */
+  ring1Overrides?: Map<string, string>;
 }
 
 /** Token accounting for an assembled payload. */
@@ -61,8 +65,20 @@ export interface AssembleResult {
   activeFilePaths: string[];
   /** Ring-0 full text of the active file(s). */
   activeSource: string;
-  /** Ring-1 entries actually included. */
-  included: { filePath: string; language: string | null }[];
+  /** Ring-0 text actually emitted, in `activeFilePaths` order. */
+  ring0Texts: string[];
+  /** True when any Ring-0 file was slimmed to its focus lines. */
+  ring0Focused: boolean;
+  /**
+   * Ring-1 entries actually included. `skeleton` is the emitted text (absent
+   * for unindexed files); `usedOnly` marks a used-exports filtered skeleton.
+   */
+  included: {
+    filePath: string;
+    language: string | null;
+    skeleton?: string;
+    usedOnly?: boolean;
+  }[];
   /** Paths referenced by imports that could not be resolved to a file. */
   unresolved: string[];
   /** Approximate token accounting for this payload. */
@@ -70,7 +86,7 @@ export interface AssembleResult {
 }
 
 /** Markdown headers/fences overhead subtracted from a `maxTokens` budget. */
-const MARKDOWN_OVERHEAD_TOKENS = 40;
+export const MARKDOWN_OVERHEAD_TOKENS = 40;
 
 /**
  * Build the compressed context for one or more open files.
@@ -92,6 +108,8 @@ export function assembleMany(
     maxSkeletons = 50,
     maxTokens,
     pruneActiveFile = false,
+    ring0Overrides,
+    ring1Overrides,
   } = opts;
 
   const absList = activeFiles.map((p) => path.resolve(p));
@@ -106,9 +124,12 @@ export function assembleMany(
 
   // Ring-0 text that will actually be emitted (pruned only on request).
   const ring0Texts = absList.map((abs, i) => {
+    const override = ring0Overrides?.get(abs);
+    if (override !== undefined) return override;
     const entry = cache.get(abs);
     return pruneActiveFile && entry ? entry.skeleton : sources[i];
   });
+  const focused = absList.some((abs) => ring0Overrides?.has(abs));
 
   const included: AssembleResult['included'] = [];
   const unresolved: string[] = [];
@@ -169,13 +190,19 @@ export function assembleMany(
   for (const cand of ordered) {
     if (selected.length >= maxSkeletons) break;
     const entry = cache.get(cand.filePath);
+    const override = ring1Overrides?.get(cand.filePath);
+    const skeleton = entry ? (override ?? entry.skeleton) : undefined;
     // Unindexed candidates get a small nominal cost until they are indexed.
-    const cost = entry ? approximateTokens(entry.skeleton) : 8;
+    const cost = skeleton !== undefined ? approximateTokens(skeleton) : 8;
     if (budget !== undefined && dependencyTokens + cost > budget) {
       trimmed++;
       continue;
     }
-    selected.push(cand);
+    selected.push({
+      ...cand,
+      ...(skeleton !== undefined ? { skeleton } : {}),
+      ...(entry && override !== undefined ? { usedOnly: true } : {}),
+    });
     dependencyTokens += cost;
     dependencyOriginalTokens += entry?.originalTokens ?? cost;
   }
@@ -213,6 +240,12 @@ export function assembleMany(
       : '## Ring 0 — Active files (full text)',
     '',
   );
+  if (focused) {
+    lines.push(
+      '_Focused to fit the token budget: bodies outside the focus lines are pruned._',
+      '',
+    );
+  }
   for (let i = 0; i < absList.length; i++) {
     if (absList.length > 1) lines.push(`### \`${rel(absList[i])}\``, '');
     const body = ring0Texts[i].trim() || '(empty or unreadable file)';
@@ -230,11 +263,10 @@ export function assembleMany(
     lines.push('_No local dependency skeletons available._', '');
   }
   for (const inc of selected) {
-    const entry = cache.get(inc.filePath);
     const label = rel(inc.filePath);
-    lines.push(`### \`${label}\``, '');
-    if (entry) {
-      lines.push(`\`\`\`${ext(inc.filePath)}`, entry.skeleton.trim(), '```', '');
+    lines.push(`### \`${label}\`${inc.usedOnly ? ' (used exports only)' : ''}`, '');
+    if (inc.skeleton !== undefined) {
+      lines.push(`\`\`\`${ext(inc.filePath)}`, inc.skeleton.trim(), '```', '');
     } else {
       lines.push('_Unindexed file._', '');
     }
@@ -269,6 +301,8 @@ export function assembleMany(
     activeFilePath: absList[0] ?? '',
     activeFilePaths: absList,
     activeSource: sources.join('\n'),
+    ring0Texts,
+    ring0Focused: focused,
     included: selected,
     unresolved,
     tokenStats: {
@@ -336,7 +370,7 @@ export function extractSpecifiers(source: string): string[] {
 }
 
 /** Resolve a fallback specifier to an existing file, mirroring sync.resolveImport. */
-function resolveLocal(importer: string, specifier: string): string | null {
+export function resolveLocal(importer: string, specifier: string): string | null {
   if (!/^[.~@]/.test(specifier)) return null;
   if (specifier.startsWith('@/')) specifier = specifier.slice(2);
   else if (specifier.startsWith('~')) specifier = specifier.slice(1);

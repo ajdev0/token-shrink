@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { gitChangedFiles } from '../src/git.js';
+import { gitChangedFiles, gitChangedLines } from '../src/git.js';
 
 describe('gitChangedFiles', () => {
   let repo: string;
@@ -91,5 +91,28 @@ describe('gitChangedFiles', () => {
     const res = await gitChangedFiles(plain, { scope: 'worktree' });
     expect(res.error).toBeTruthy();
     expect(res.files).toEqual([]);
+  });
+});
+
+describe('gitChangedLines', () => {
+  it('reports new-side line numbers for modified and deleted lines', async () => {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-hunks-'));
+    const git = (args: string[]) => execFileSync('git', args, { cwd: repo, stdio: 'pipe' });
+    git(['init', '-b', 'main']);
+    git(['config', 'user.email', 't@example.com']);
+    git(['config', 'user.name', 'Test']);
+    git(['config', 'diff.noprefix', 'true']);
+    const file = path.join(repo, 'x.ts');
+    fs.writeFileSync(file, ['l1', 'l2', 'l3', 'l4', 'l5', 'l6'].join('\n') + '\n');
+    git(['add', '-A']);
+    git(['commit', '-m', 'init']);
+    // change line 2, delete line 5, append a line
+    fs.writeFileSync(file, ['l1', 'L2', 'l3', 'l4', 'l6', 'l7'].join('\n') + '\n');
+    try {
+      const lines = await gitChangedLines(repo, { scope: 'worktree' });
+      expect(lines.get(file)).toEqual([2, 4, 6]);
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
   });
 });

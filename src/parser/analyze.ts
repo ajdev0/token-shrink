@@ -15,6 +15,7 @@ import path from 'node:path';
 import { languageForFile, type LanguageSpec } from './registry.js';
 import { getGrammar } from './wasm.js';
 import { collectSymbols, type SymbolInfo } from './symbols.js';
+import { unusedTopLevelRanges } from './used-exports.js';
 
 /** A byte-range that will be replaced by `token`. */
 export interface PruneRange {
@@ -128,6 +129,18 @@ export interface AnalyzeOptions {
    * preceding source window contains `@<marker>` is kept fully unpruned.
    */
   preserveAnnotations?: string[];
+  /**
+   * 1-based lines the reader is focused on (cursor, changed hunks). The
+   * innermost definition containing each line, and every block containing
+   * it, stay unpruned; everything else is pruned as usual.
+   */
+  focusLines?: number[];
+  /**
+   * Names an importer actually uses (`default` for a default import). When
+   * set, top-level TS/JS statements those names don't reach are dropped.
+   * Ignored when the file has no ES exports or declares none of the names.
+   */
+  keepOnly?: string[];
 }
 
 export interface AnalyzeResult {
@@ -164,7 +177,13 @@ export async function analyze(
   }
 
   const parser = new Parser();
-  parser.setLanguage(language);
+  try {
+    parser.setLanguage(language);
+  } catch {
+    // Grammar ABI newer than the bundled runtime: keep the file usable, unpruned.
+    parser.delete();
+    return { code: source, language: null, removed: 0, symbols: [] };
+  }
   const tree = parser.parse(source);
   try {
     const symbols = collectSymbols(tree.rootNode, source);
@@ -180,8 +199,16 @@ export async function analyze(
         ? annotatedKeepRanges(symbols, source, opts.preserveAnnotations)
         : []),
     ];
+    const focusOffsets = (opts.focusLines ?? [])
+      .map((line) => lineOffset(source, line))
+      .filter((o): o is number => o !== null);
+    for (const offset of focusOffsets) {
+      const inner = innermostSymbol(symbols, offset);
+      if (inner) keepRanges.push({ start: inner.start, end: inner.end });
+    }
     const isProtected = (start: number, end: number) =>
-      keepRanges.some((k) => k.start <= start && end <= k.end);
+      keepRanges.some((k) => k.start <= start && end <= k.end) ||
+      focusOffsets.some((o) => start <= o && o < end);
     const annotationRe = annotationRegExp(opts.preserveAnnotations ?? []);
 
     const ranges: PruneRange[] = [];
@@ -220,6 +247,9 @@ export async function analyze(
         });
       }
       query.delete();
+    }
+    if (opts.keepOnly) {
+      ranges.push(...unusedTopLevelRanges(tree.rootNode, source, opts.keepOnly, ranges));
     }
 
     const { code, removed } = spliceRanges(source, ranges);
@@ -274,6 +304,31 @@ function annotatedKeepRanges(
       return re.test(relevant);
     })
     .map((s) => ({ start: s.start, end: s.end }));
+}
+
+/** Byte offset of the first non-blank character on a 1-based line, or null past EOF. */
+function lineOffset(source: string, line: number): number | null {
+  if (!Number.isInteger(line) || line < 1) return null;
+  let offset = 0;
+  for (let l = 1; l < line; l++) {
+    const nl = source.indexOf('\n', offset);
+    if (nl === -1) return null;
+    offset = nl + 1;
+  }
+  const lineEnd = source.indexOf('\n', offset);
+  const text = source.slice(offset, lineEnd === -1 ? source.length : lineEnd);
+  return offset + (text.length - text.trimStart().length);
+}
+
+/** Smallest symbol whose range contains `offset`. */
+function innermostSymbol(symbols: SymbolInfo[], offset: number): SymbolInfo | null {
+  let best: SymbolInfo | null = null;
+  for (const s of symbols) {
+    if (s.start <= offset && offset < s.end && (!best || s.end - s.start < best.end - best.start)) {
+      best = s;
+    }
+  }
+  return best;
 }
 
 /** `@marker` matcher for the configured annotations, or null when none. */

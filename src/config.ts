@@ -30,7 +30,14 @@ export interface TokenShrinkConfig {
    * (true / unset): rules choreograph the tools automatically each task.
    */
   autoWorkflow?: boolean;
+  /**
+   * `used`: Ring-1 skeletons keep only the exports Ring 0 imports (plus the
+   * declarations their signatures reference). `full` (default): whole skeleton.
+   */
+  ringOneMode?: RingOneMode;
 }
+
+export type RingOneMode = 'used' | 'full';
 
 export const EMPTY_CONFIG: TokenShrinkConfig = {
   ignorePatterns: [],
@@ -76,6 +83,9 @@ function normalizeConfig(
     keepUnpruned: asStrings(obj.keepUnpruned),
     preserveAnnotations: asStrings(obj.preserveAnnotations),
     ...(typeof obj.autoWorkflow === 'boolean' ? { autoWorkflow: obj.autoWorkflow } : {}),
+    ...(obj.ringOneMode === 'used' || obj.ringOneMode === 'full'
+      ? { ringOneMode: obj.ringOneMode }
+      : {}),
   };
 }
 

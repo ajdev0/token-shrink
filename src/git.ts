@@ -116,3 +116,51 @@ export async function gitChangedFiles(
 
   return { files };
 }
+
+/** `git diff` arguments selecting the same changes as `gitChangedFiles`. */
+function diffArgsFor(opts: GitChangedOptions): string[][] {
+  if (opts.scope === 'staged') return [['--cached']];
+  if (opts.scope === 'branch') return [[`${opts.base ?? 'HEAD~1'}...${opts.head ?? 'HEAD'}`]];
+  return [[], ['--cached']];
+}
+
+/**
+ * Changed (new-side) line numbers per absolute file path, from zero-context
+ * hunks. A pure deletion marks the line it happened at. Untracked files have
+ * no hunks and are simply absent.
+ */
+export async function gitChangedLines(
+  root: string,
+  opts: GitChangedOptions,
+): Promise<Map<string, number[]>> {
+  const out = new Map<string, Set<number>>();
+  for (const args of diffArgsFor(opts)) {
+    const r = await runGit(root, [
+      'diff',
+      '-U0',
+      '--no-color',
+      '--no-ext-diff',
+      '--src-prefix=a/',
+      '--dst-prefix=b/',
+      ...args,
+    ]);
+    if (!r.ok) continue;
+    let file: string | null = null;
+    for (const line of r.out.split('\n')) {
+      if (line.startsWith('+++ ')) {
+        const p = line.slice(4).trim();
+        file = p === '/dev/null' ? null : path.resolve(root, p.slice(2));
+        continue;
+      }
+      const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line);
+      if (!hunk || !file) continue;
+      const start = Number(hunk[1]);
+      const count = hunk[2] === undefined ? 1 : Number(hunk[2]);
+      const set = out.get(file) ?? new Set<number>();
+      if (count === 0) set.add(Math.max(1, start));
+      for (let l = start; l < start + count; l++) set.add(l);
+      out.set(file, set);
+    }
+  }
+  return new Map([...out].map(([f, s]) => [f, [...s].sort((a, b) => a - b)]));
+}

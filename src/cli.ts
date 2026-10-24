@@ -13,7 +13,8 @@ import picocolors from 'picocolors';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { assembleMany } from './server/assembler.js';
+import { assembleContext } from './server/context.js';
+import { loadConfig, matchesAny, type RingOneMode } from './config.js';
 import { createWatcher, type Matcher } from './watcher/sync.js';
 import { warmGrammars } from './parser/wasm.js';
 import {
@@ -71,7 +72,8 @@ export async function startServer(opts: CliOptions = {}) {
   // Warm grammars in the background so the first prune isn't slow.
   void warmGrammars().catch(() => {});
 
-  const watcher = createWatcher({ root, ignored: opts.ignored });
+  const config = loadConfig(root, log);
+  const watcher = createWatcher({ root, ignored: opts.ignored, config });
   log(`Indexing ${root} in the background…`);
   void watcher.indexAll().then((n) => log(`Indexed ${n} files.`));
 
@@ -92,6 +94,8 @@ export async function startServer(opts: CliOptions = {}) {
       maxSkeletons?: number;
       maxTokens?: number;
       includeStats?: boolean;
+      focusLines?: number[] | Record<string, number[]>;
+      ringOneMode?: RingOneMode;
     };
     const hasMany = Array.isArray(body.activeFiles) && body.activeFiles.length > 0;
     if (hasMany && body.activeFilePath) {
@@ -109,10 +113,15 @@ export async function startServer(opts: CliOptions = {}) {
     }
     const maxTokens =
       body.maxTokens !== undefined ? body.maxTokens : maxTokensDefault;
-    const result = assembleMany(paths, watcher.cache.entries, {
+    const result = await assembleContext(paths, watcher.cache.entries, {
       maxSkeletons: body.maxSkeletons,
       maxTokens: Number.isFinite(maxTokens as number) ? (maxTokens as number) : undefined,
       includeStats: body.includeStats,
+      focusLines: Array.isArray(body.focusLines) ? { [paths[0]]: body.focusLines } : body.focusLines,
+      ringOneMode: body.ringOneMode ?? config.ringOneMode ?? 'full',
+      preserveAnnotations: config.preserveAnnotations,
+      isKeepUnpruned: (abs) =>
+        config.keepUnpruned.length > 0 && matchesAny(path.relative(root, abs), config.keepUnpruned),
     });
     if (!silent) console.log(formatSavings(result.tokenStats, { color: wantsColor(process.stdout) }));
     recordSavings(root, 'v1/context', result.tokenStats, sessionStartedAt);

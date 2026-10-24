@@ -106,6 +106,11 @@ const ARRAY_LITERAL = {
 };
 
 const COMMENT = { query: '(comment) @comment', replacement: { token: '', comment: true } };
+const DART_BLOCK = { query: '(block) @block', replacement: { token: '/* ... */' } };
+const DART_COMMENT = {
+  query: '[(comment) (documentation_comment)] @comment',
+  replacement: { token: '', comment: true },
+};
 const LINE_BLOCK_COMMENT = {
   query: '[(line_comment) (block_comment)] @comment',
   replacement: { token: '', comment: true },
@@ -130,7 +135,7 @@ export const registry: Record<string, LanguageSpec> = {
   javascript: {
     name: 'JavaScript',
     wasm: 'tree-sitter-javascript.wasm',
-    url: 'https://github.com/tree-sitter/tree-sitter-javascript/releases/download/v0.23.1/tree-sitter-javascript.wasm',
+    url: 'https://github.com/tree-sitter/tree-sitter-javascript/releases/download/v0.25.0/tree-sitter-javascript.wasm',
     extensions: ['.js', '.cjs', '.mjs'],
     rules: [BLOCK, ...JS_EXTRAS],
   },
@@ -144,45 +149,43 @@ export const registry: Record<string, LanguageSpec> = {
   jsx: {
     name: 'React (JSX)',
     wasm: 'tree-sitter-javascript.wasm',
-    url: 'https://github.com/tree-sitter/tree-sitter-javascript/releases/download/v0.23.1/tree-sitter-javascript.wasm',
+    url: 'https://github.com/tree-sitter/tree-sitter-javascript/releases/download/v0.25.0/tree-sitter-javascript.wasm',
     extensions: ['.jsx'],
     rules: [{ query: '(statement_block) @block', replacement: DIRECTIVE_KEEP }, ...JS_EXTRAS],
   },
   python: {
     name: 'Python',
     wasm: 'tree-sitter-python.wasm',
-    url: 'https://github.com/tree-sitter/tree-sitter-python/releases/download/v0.23.6/tree-sitter-python.wasm',
+    url: 'https://github.com/tree-sitter/tree-sitter-python/releases/download/v0.25.0/tree-sitter-python.wasm',
     extensions: ['.py', '.pyi'],
     rules: [PY_BLOCK, COMMENT],
   },
   dart: {
     name: 'Dart / Flutter',
     wasm: 'tree-sitter-dart.wasm',
-    // The only prebuilt Dart grammar targets tree-sitter ABI 15, newer than the
-    // bundled web-tree-sitter (13–14) can load. With no rules, Dart files are
-    // indexed as full text without a download attempt.
-    url: 'https://cdn.jsdelivr.net/npm/tree-sitter-wasms@0.1.13/out/tree-sitter-dart.wasm',
+    // Upstream publishes no wasm build; this is the Repomix project's prebuilt grammar.
+    url: 'https://cdn.jsdelivr.net/npm/@repomix/tree-sitter-wasms@0.1.17/out/tree-sitter-dart.wasm',
     extensions: ['.dart'],
-    rules: [],
+    rules: [DART_BLOCK, DART_COMMENT],
   },
   swift: {
     name: 'Swift / SwiftUI',
     wasm: 'tree-sitter-swift.wasm',
-    url: 'https://cdn.jsdelivr.net/npm/tree-sitter-wasms@0.1.12/out/tree-sitter-swift.wasm',
+    url: 'https://github.com/alex-pinkus/tree-sitter-swift/releases/download/0.7.3/tree-sitter-swift.wasm',
     extensions: ['.swift'],
     rules: [SWIFT_BLOCK],
   },
   go: {
     name: 'Go',
     wasm: 'tree-sitter-go.wasm',
-    url: 'https://github.com/tree-sitter/tree-sitter-go/releases/download/v0.23.4/tree-sitter-go.wasm',
+    url: 'https://github.com/tree-sitter/tree-sitter-go/releases/download/v0.25.0/tree-sitter-go.wasm',
     extensions: ['.go'],
     rules: [GO_BLOCK, COMMENT],
   },
   rust: {
     name: 'Rust',
     wasm: 'tree-sitter-rust.wasm',
-    url: 'https://github.com/tree-sitter/tree-sitter-rust/releases/download/v0.23.2/tree-sitter-rust.wasm',
+    url: 'https://github.com/tree-sitter/tree-sitter-rust/releases/download/v0.24.2/tree-sitter-rust.wasm',
     extensions: ['.rs'],
     rules: [RUST_BLOCK, LINE_BLOCK_COMMENT],
   },
@@ -203,7 +206,7 @@ export const registry: Record<string, LanguageSpec> = {
   c: {
     name: 'C',
     wasm: 'tree-sitter-c.wasm',
-    url: 'https://github.com/tree-sitter/tree-sitter-c/releases/download/v0.23.4/tree-sitter-c.wasm',
+    url: 'https://github.com/tree-sitter/tree-sitter-c/releases/download/v0.24.2/tree-sitter-c.wasm',
     extensions: ['.c', '.h'],
     rules: [C_BLOCK, COMMENT],
   },
@@ -217,7 +220,7 @@ export const registry: Record<string, LanguageSpec> = {
   php: {
     name: 'PHP',
     wasm: 'tree-sitter-php.wasm',
-    url: 'https://github.com/tree-sitter/tree-sitter-php/releases/download/v0.23.11/tree-sitter-php.wasm',
+    url: 'https://github.com/tree-sitter/tree-sitter-php/releases/download/v0.25.1/tree-sitter-php.wasm',
     extensions: ['.php'],
     rules: [PHP_BLOCK, COMMENT],
   },

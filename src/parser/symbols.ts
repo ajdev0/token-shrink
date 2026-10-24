@@ -11,7 +11,7 @@
  * `name` field (e.g. C/C++ `function_definition`) simply contribute nothing.
  */
 
-import type { SyntaxNode } from 'web-tree-sitter';
+import type { Node } from 'web-tree-sitter';
 
 export type SymbolKind =
   | 'function'
@@ -74,9 +74,9 @@ const SIGNATURE_MAX = 200;
  * Walk `root` and collect every named definition with its byte range.
  * `source` is only needed to build signature/line previews.
  */
-export function collectSymbols(root: SyntaxNode, source: string): SymbolInfo[] {
+export function collectSymbols(root: Node, source: string): SymbolInfo[] {
   const out: SymbolInfo[] = [];
-  const walk = (node: SyntaxNode) => {
+  const walk = (node: Node) => {
     const kind = KIND_BY_TYPE[node.type];
     if (kind) {
       const nameNode = node.childForFieldName('name');

@@ -91,7 +91,8 @@ wasm/
 ```
 
 - First run requires network access; afterwards everything is offline and fast.
-- Each grammar is pinned to a release built for tree-sitter ABI 13–14, the range the bundled `web-tree-sitter` 0.24 runtime loads (newer upstream releases target ABI 15). A cached grammar the runtime can't load is replaced with the pinned one automatically.
+- Each grammar is pinned to an exact release that the bundled `web-tree-sitter` 0.27 runtime loads (tree-sitter ABI 13–15). Cache files are keyed by the pinned URL, so a new pin is fetched automatically, and a cached grammar the runtime can't load is re-downloaded.
+- Dart has no upstream wasm release; it comes from the [`@repomix/tree-sitter-wasms`](https://www.npmjs.com/package/@repomix/tree-sitter-wasms) prebuilt package.
 - Files are written atomically (`*.tmp` → rename) with an in-flight lock, so concurrent first-run parses never corrupt the cache.
 
 ---
@@ -315,7 +316,7 @@ S-expression queries match implementation blocks; interfaces, signatures, and ex
 | React / Next.js | `.tsx`                                  | `tree-sitter-tsx.wasm`        | `statement_block`¹   |
 | React (JSX)     | `.jsx`                                  | `tree-sitter-javascript.wasm` | `statement_block`¹   |
 | Python          | `.py` `.pyi`                            | `tree-sitter-python.wasm`     | `block` → `pass`     |
-| Dart / Flutter  | `.dart`                                 | `tree-sitter-dart.wasm`       | — (indexed unpruned)² |
+| Dart / Flutter  | `.dart`                                 | `tree-sitter-dart.wasm`       | `block`              |
 | Swift / SwiftUI | `.swift`                                | `tree-sitter-swift.wasm`      | `statements`         |
 | Go              | `.go`                                   | `tree-sitter-go.wasm`         | `block`              |
 | Rust            | `.rs`                                   | `tree-sitter-rust.wasm`       | `block`              |
@@ -326,8 +327,6 @@ S-expression queries match implementation blocks; interfaces, signatures, and ex
 | PHP             | `.php`                                  | `tree-sitter-php.wasm`        | `compound_statement` |
 
 
-> ² No prebuilt Dart grammar for ABI 13–14 exists, so Dart files are currently kept in full (no pruning, no symbol search) until the runtime is upgraded.
->
 > ¹ TSX/JSX also preserve `'use client'` / `'use server'` directive lines inside otherwise-pruned bodies (framework-aware).
 
 Language IDs: `typescript · javascript · tsx · jsx · python · dart · swift · go · rust · java · kotlin · c · cpp · php`.

@@ -10,7 +10,7 @@
  * declared here (barrel / re-export files).
  */
 
-import type Parser from 'web-tree-sitter';
+import type { Node } from 'web-tree-sitter';
 
 import type { PruneRange } from './analyze.js';
 
@@ -35,9 +35,9 @@ const DECLARATION_TYPES = new Set([
 const REFERENCE_TYPES = new Set(['identifier', 'type_identifier', 'shorthand_property_identifier']);
 
 interface TopLevel {
-  node: Parser.SyntaxNode;
+  node: Node;
   /** Comments directly above the statement (removed together with it). */
-  leading: Parser.SyntaxNode[];
+  leading: Node[];
   /** Local names this statement binds. */
   binds: string[];
   /** Names it is visible under to importers (`default` for default exports). */
@@ -49,7 +49,7 @@ interface TopLevel {
 }
 
 /** Names bound by a declaration node (`name` field or variable declarators). */
-function declaredNames(node: Parser.SyntaxNode): string[] {
+function declaredNames(node: Node): string[] {
   if (node.type === 'ambient_declaration') {
     return node.namedChildren.flatMap(declaredNames);
   }
@@ -68,7 +68,7 @@ function declaredNames(node: Parser.SyntaxNode): string[] {
 }
 
 /** Local names bound by an `import …` statement. */
-function importBindings(node: Parser.SyntaxNode): string[] {
+function importBindings(node: Node): string[] {
   const clause = node.namedChildren.find((c) => c.type === 'import_clause');
   if (!clause) return [];
   const names: string[] = [];
@@ -88,7 +88,7 @@ function importBindings(node: Parser.SyntaxNode): string[] {
   return names;
 }
 
-function classify(node: Parser.SyntaxNode): Omit<TopLevel, 'leading'> {
+function classify(node: Node): Omit<TopLevel, 'leading'> {
   const base = { node, binds: [] as string[], exports: [] as string[], always: false, locals: [] as string[] };
   if (node.type === 'import_statement') return { ...base, binds: importBindings(node) };
   if (node.type === 'export_statement') {
@@ -121,7 +121,7 @@ function classify(node: Parser.SyntaxNode): Omit<TopLevel, 'leading'> {
 }
 
 /** Referenced names inside `node`, ignoring text that pruning removes anyway. */
-function references(node: Parser.SyntaxNode, pruned: PruneRange[]): string[] {
+function references(node: Node, pruned: PruneRange[]): string[] {
   const inside = pruned.filter((r) => r.start >= node.startIndex && r.end <= node.endIndex);
   return node
     .descendantsOfType([...REFERENCE_TYPES])
@@ -135,14 +135,14 @@ function references(node: Parser.SyntaxNode, pruned: PruneRange[]): string[] {
  * collapsed bodies do not keep their targets alive.
  */
 export function unusedTopLevelRanges(
-  root: Parser.SyntaxNode,
+  root: Node,
   source: string,
   keep: string[],
   pruned: PruneRange[],
 ): PruneRange[] {
   if (root.type !== 'program') return [];
   const items: TopLevel[] = [];
-  let leading: Parser.SyntaxNode[] = [];
+  let leading: Node[] = [];
   for (const node of root.namedChildren) {
     if (node.type === 'comment') {
       leading.push(node);
